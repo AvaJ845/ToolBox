@@ -84,6 +84,25 @@ function Write-Banner {
 
   Results will be saved to: $($script:ReportPath)
 ===============================================================================
+  HOW TO RUN THIS SCRIPT
+  ─────────────────────────────────────────────────────────────────────────────
+  This script is not digitally signed. If PowerShell blocks it, run this
+  command FIRST in the same PowerShell window, then run the script:
+
+    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
+  IMPORTANT: This only affects the current PowerShell session.
+  It does NOT permanently change your system's security settings.
+  It reverts automatically when the PowerShell window is closed.
+
+  Full command to run this script:
+
+    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass; .\Invoke-AzMigrateConnectivityCheck.ps1
+
+  If your organisation requires signed scripts, contact your security team to
+  add a bypass exception for this script, or ask them to sign it using your
+  organisation's internal code signing certificate.
+===============================================================================
 "@
     Write-Host $banner -ForegroundColor Cyan
 }
@@ -3951,6 +3970,48 @@ function Main {
         Write-Host "  Please update PowerShell and re-run this script." -ForegroundColor Red
         return
     }
+
+    # ----- Execution Policy Notice -----
+    $currentPolicy = Get-ExecutionPolicy -Scope Process -ErrorAction SilentlyContinue
+    $machinePolicy = Get-ExecutionPolicy -Scope LocalMachine -ErrorAction SilentlyContinue
+    $userPolicy    = Get-ExecutionPolicy -Scope CurrentUser  -ErrorAction SilentlyContinue
+
+    Write-Section "EXECUTION POLICY INFORMATION"
+    Write-Host "  Current session policy : $currentPolicy" -ForegroundColor Gray
+    Write-Host "  Machine policy         : $machinePolicy" -ForegroundColor Gray
+    Write-Host "  User policy            : $userPolicy" -ForegroundColor Gray
+    Write-Host ""
+
+    if ($currentPolicy -in @('Bypass','Unrestricted')) {
+        Write-Host "  [OK] Execution policy is set to '$currentPolicy' for this session." -ForegroundColor Green
+        Write-Host "  The script is running correctly. This setting only affects this" -ForegroundColor Green
+        Write-Host "  PowerShell window and reverts when the window is closed." -ForegroundColor Green
+    } elseif ($currentPolicy -eq 'AllSigned') {
+        Write-Host "  [WARN] Execution policy is 'AllSigned' — this script is NOT digitally signed." -ForegroundColor Yellow
+        Write-Host "  If you are seeing this message, the script ran anyway (possibly via a parent" -ForegroundColor Yellow
+        Write-Host "  process bypass). To run explicitly, use:" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass" -ForegroundColor Cyan
+        Write-Host "    .\Invoke-AzMigrateConnectivityCheck.ps1" -ForegroundColor Cyan
+        [void]$script:Warnings.Add("Execution policy is AllSigned. This script is unsigned. Run with: Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass")
+    } elseif ($currentPolicy -eq 'RemoteSigned') {
+        Write-Host "  [INFO] Execution policy is 'RemoteSigned'." -ForegroundColor Gray
+        Write-Host "  If this script was downloaded from the internet and is blocked, run:" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "    Unblock-File -Path .\Invoke-AzMigrateConnectivityCheck.ps1" -ForegroundColor Cyan
+        Write-Host "    OR" -ForegroundColor Gray
+        Write-Host "    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass" -ForegroundColor Cyan
+    } else {
+        Write-Host "  [INFO] Execution policy: $currentPolicy — script is running." -ForegroundColor Gray
+    }
+
+    Write-Host ""
+    Write-Host "  NOTE: Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass is SAFE to use." -ForegroundColor White
+    Write-Host "  'Scope Process' means it ONLY applies to this PowerShell window." -ForegroundColor White
+    Write-Host "  It does NOT change any system-wide settings." -ForegroundColor White
+    Write-Host "  It does NOT persist after this window is closed." -ForegroundColor White
+    Write-Host "  It does NOT require a reboot or any cleanup." -ForegroundColor White
+    Write-Host ""
 
     # ----- User Prompts -----
     Write-Section "DEPLOYMENT SCENARIO SELECTION"

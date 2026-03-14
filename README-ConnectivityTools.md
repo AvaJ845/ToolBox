@@ -26,12 +26,59 @@ Run on the Azure Migrate appliance. Prompts for your deployment scenario, tests 
 
 ### How to Run
 
+**Step 1 — Open PowerShell as Administrator**
+Right-click the Start menu → **Windows PowerShell (Admin)**
+
+**Step 2 — Navigate to the script folder**
+```powershell
+cd C:\Path\To\Script
+```
+
+**Step 3 — Run the script**
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\Invoke-AzMigrateConnectivityCheck.ps1
 ```
 
-Answer the 5 prompts, press Enter, wait 2-5 minutes.
+Or as a single line:
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass; .\Invoke-AzMigrateConnectivityCheck.ps1
+```
+
+Answer the prompts, press Enter, and wait 2–5 minutes for results.
+
+---
+
+### ⚠️ About the Execution Policy Bypass
+
+This script is **not digitally signed**. PowerShell may block it depending on your system's Execution Policy setting. The command above fixes this safely.
+
+#### Why `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` is safe:
+
+| Question | Answer |
+|---|---|
+| Does it change system-wide settings? | **No.** `Scope Process` means it only applies to the current PowerShell window. |
+| Does it persist after closing PowerShell? | **No.** It reverts automatically when the window is closed. |
+| Does it require a reboot or cleanup? | **No.** Nothing to undo. |
+| Does it affect other PowerShell windows? | **No.** Each PowerShell window has its own process scope. |
+| Will security tools flag it? | Some EDR/SIEM tools log execution policy changes. This is normal and expected for troubleshooting scripts. |
+
+#### What if my organisation requires signed scripts?
+
+If your security policy requires `AllSigned` and you cannot use the bypass:
+
+1. **Ask your security team** to add a bypass exception for this specific script
+2. **Ask your security team to sign it** using your organisation's internal code signing certificate:
+   ```powershell
+   $cert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert
+   Set-AuthenticodeSignature -FilePath .\Invoke-AzMigrateConnectivityCheck.ps1 -Certificate $cert
+   ```
+3. **Unblock the file** if it was downloaded from the internet (removes the Zone.Identifier stream):
+   ```powershell
+   Unblock-File -Path .\Invoke-AzMigrateConnectivityCheck.ps1
+   ```
+
+---
 
 ### Reading the Output
 
