@@ -353,8 +353,20 @@ function Get-UrlDefinitions {
             # VMware Agentless / Replication-only endpoints
             if ($Scenario -eq 'VMwareAgentless' -or $ApplianceType -eq 'Replication') {
                 $cat2 = 'VMware Agentless Migration'
-                local:Add-Url $urls 'hypervrecoverymanager.windowsazure.com' 443 '*.hypervrecoverymanager.windowsazure.com' 'Azure Site Recovery (agentless migration)' $cat2
-                local:Add-Url $urls 'blob.core.windows.net'                  443 '*.blob.core.windows.net'                  'Azure Blob Storage (migration data upload)' $cat2
+                local:Add-Url $urls 'hypervrecoverymanager.windowsazure.com' 443 '*.hypervrecoverymanager.windowsazure.com' 'Azure Site Recovery (agentless migration)'  $cat2
+                local:Add-Url $urls 'blob.core.windows.net'                  443 '*.blob.core.windows.net'                  'Azure Blob Storage (migration data upload)'  $cat2
+            }
+
+            # Simplified Experience (AgentBasedModern) — additional required URLs per ASR replication appliance support matrix
+            if ($Scenario -eq 'AgentBasedModern') {
+                $cat3 = 'Simplified Experience (Agent-Based Modern) — Additional URLs'
+                local:Add-Url $urls 'backup.windowsazure.com'                443 '*.backup.windowsazure.com'                'Protection service / replication disk creation (Simplified Experience — REQUIRED)'  $cat3
+                local:Add-Url $urls 'hypervrecoverymanager.windowsazure.com' 443 '*.hypervrecoverymanager.windowsazure.com' 'ASR microservice (Simplified Experience)'    $cat3
+                local:Add-Url $urls 'discoverysrv.windowsazure.com'          443 '*.discoverysrv.windowsazure.com'          'Discovery microservice (Simplified Experience)' $cat3
+                local:Add-Url $urls 'prod.migration.windowsazure.com'        443 '*.prod.migration.windowsazure.com'        'On-prem estate discovery (Simplified Experience)' $cat3
+                local:Add-Url $urls 'blob.core.windows.net'                  443 '*.blob.core.windows.net'                  'Azure Storage for replicated disks (Simplified Experience)' $cat3
+                # Note: vault.azure.net, servicebus.windows.net already in core list above
+                Write-Host "  [INFO] Simplified Experience URLs added — includes *.backup.windowsazure.com required for replication disk creation." -ForegroundColor Cyan
             }
 
         } else {
@@ -414,6 +426,15 @@ function Get-UrlDefinitions {
                 local:Add-Url $urls 'blob.core.usgovcloudapi.net'           443 '*.blob.core.usgovcloudapi.net'           'Azure Blob Storage (Gov)'        $cat2
             }
 
+            # Simplified Experience — Government additional URLs
+            if ($Scenario -eq 'AgentBasedModern') {
+                $cat3 = 'Simplified Experience (Gov) — Additional URLs'
+                local:Add-Url $urls 'backup.windowsazure.us'                443 '*.backup.windowsazure.us'                'Protection service / replication disk creation (Simplified Gov — REQUIRED)' $cat3
+                local:Add-Url $urls 'hypervrecoverymanager.windowsazure.us' 443 '*.hypervrecoverymanager.windowsazure.us' 'ASR microservice (Simplified Gov)' $cat3
+                local:Add-Url $urls 'migration.windowsazure.us'             443 '*.migration.windowsazure.us'             'Migration service (Simplified Gov)' $cat3
+                local:Add-Url $urls 'vault.usgovcloudapi.net'               443 '*.vault.usgovcloudapi.net'               'Key Vault (Simplified Gov — source VMs also need this)' $cat3
+            }
+
         } else {
             # ----------------------------------------------------------------
             # Government — Private Link endpoints
@@ -461,6 +482,16 @@ function Get-UrlDefinitions {
                 $cat2 = 'VMware Agentless Migration (China)'
                 local:Add-Url $urls 'cn2.hypervrecoverymanager.windowsazure.cn' 443 '*.cn2.hypervrecoverymanager.windowsazure.cn' 'ASR (China agentless migration)' $cat2
                 local:Add-Url $urls 'blob.core.chinacloudapi.cn'                443 '*.blob.core.chinacloudapi.cn'                'Azure Blob Storage (China)'       $cat2
+            }
+
+            # Simplified Experience — China additional URLs
+            if ($Scenario -eq 'AgentBasedModern') {
+                $cat3 = 'Simplified Experience (China) — Additional URLs'
+                local:Add-Url $urls 'backup.windowsazure.cn'                    443 '*.backup.windowsazure.cn'                    'Protection service / replication disk creation (Simplified China — REQUIRED)' $cat3
+                local:Add-Url $urls 'cn2.hypervrecoverymanager.windowsazure.cn' 443 '*.cn2.hypervrecoverymanager.windowsazure.cn' 'ASR microservice (Simplified China)' $cat3
+                local:Add-Url $urls 'cn2.prod.migration.windowsazure.cn'        443 '*.cn2.prod.migration.windowsazure.cn'        'Migration service (Simplified China)' $cat3
+                local:Add-Url $urls 'vault.azure.cn'                            443 '*.vault.azure.cn'                            'Key Vault (Simplified China — source VMs also need this)' $cat3
+                local:Add-Url $urls 'blob.core.chinacloudapi.cn'                443 '*.blob.core.chinacloudapi.cn'                'Azure Storage for replicated disks (Simplified China)' $cat3
             }
         } else {
             # China Private Link — no official separate list; use same as public with a note
@@ -1680,7 +1711,9 @@ $script:EventLogFindings          = [System.Collections.ArrayList]::new()
 $script:AvEdrResult               = [System.Collections.ArrayList]::new()
 $script:AdditionalPortsResult     = $null
 $script:SummaryPath               = ''
-$script:ZipPath                   = 
+$script:ZipPath                   = ''
+$script:GroupPolicyResult         = $null
+$script:AvExclusionResult         = $null
 
 
 # ============================================================================
@@ -5132,6 +5165,8 @@ function Invoke-Cleanup {
         'Version currency result'     = 'VersionCurrencyResult'
         'Event log findings'          = 'EventLogFindings'
         'AV/EDR detection result'     = 'AvEdrResult'
+        'Group policy prereqs result' = 'GroupPolicyResult'
+        'AV exclusion paths result'   = 'AvExclusionResult'
         'Additional ports result'     = 'AdditionalPortsResult'
     }
 
@@ -5194,6 +5229,319 @@ function Invoke-Cleanup {
 # ============================================================================
 # MAIN EXECUTION
 # ============================================================================
+
+
+# ============================================================================
+# TEST-GROUPPOLICYPREREQS — v5.0 addition
+# ============================================================================
+function Test-GroupPolicyPrereqs {
+    Write-Section "GROUP POLICY PREREQUISITES CHECK (Read-Only)"
+    Write-Host "  The Appliance Configuration Manager validates these Group Policy settings" -ForegroundColor Gray
+    Write-Host "  before allowing registration. If any are misconfigured, the appliance will" -ForegroundColor Gray
+    Write-Host "  display an error and refuse to register — even if the network is healthy." -ForegroundColor Gray
+    Write-Host ""
+
+    $result = @{ Checks = [System.Collections.ArrayList]::new(); AllPass = $true }
+
+    # 1. Registry access policy
+    Write-Host "  Checking: Prevent access to registry editing tools..." -ForegroundColor White
+    try {
+        $regPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+        $val = (Get-ItemProperty -Path $regPath -Name 'DisableRegistryTools' -ErrorAction SilentlyContinue).DisableRegistryTools
+        if ($null -ne $val -and $val -eq 0) {
+            Write-Host "  [FAIL] Group Policy 'Prevent access to registry editing tools' is ENABLED." -ForegroundColor Red
+            Write-Host "  This will block the Appliance Configuration Manager from completing registration." -ForegroundColor Red
+            Write-Host "  The policy must be disabled or an exception must be created for the appliance." -ForegroundColor Yellow
+            [void]$result.Checks.Add([PSCustomObject]@{ Check = 'DisableRegistryTools'; Status = 'FAIL'; Detail = "DisableRegistryTools=0 — registry access is blocked by Group Policy" })
+            $result.AllPass = $false
+            [void]$script:Recommendations.Add("GROUP POLICY BLOCK: 'Prevent access to registry editing tools' is enabled (DisableRegistryTools=0). The Appliance Configuration Manager requires registry access during registration. This policy must be changed.")
+        } else {
+            Write-Host "  [PASS] Registry access policy is not blocking appliance operations." -ForegroundColor Green
+            [void]$result.Checks.Add([PSCustomObject]@{ Check = 'DisableRegistryTools'; Status = 'PASS'; Detail = "Not restricted" })
+        }
+    } catch {
+        Write-Host "  [INFO] Could not check registry access policy: $($_.Exception.Message)" -ForegroundColor Gray
+    }
+
+    # 2. Command prompt policy
+    Write-Host ""
+    Write-Host "  Checking: Prevent access to command prompt..." -ForegroundColor White
+    try {
+        $regPath2 = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
+        $val2 = (Get-ItemProperty -Path $regPath2 -Name 'DisableCMD' -ErrorAction SilentlyContinue).DisableCMD
+        if ($null -ne $val2 -and $val2 -ne 0) {
+            Write-Host "  [FAIL] Group Policy 'Prevent access to the command prompt' is ENABLED (DisableCMD=$val2)." -ForegroundColor Red
+            Write-Host "  The Appliance Configuration Manager uses command-line operations during registration." -ForegroundColor Red
+            Write-Host "  This policy blocks appliance registration and must be disabled." -ForegroundColor Yellow
+            [void]$result.Checks.Add([PSCustomObject]@{ Check = 'DisableCMD'; Status = 'FAIL'; Detail = "DisableCMD=$val2 — command prompt blocked by Group Policy" })
+            $result.AllPass = $false
+            [void]$script:Recommendations.Add("GROUP POLICY BLOCK: 'Prevent access to the command prompt' is enabled (DisableCMD=$val2). This blocks appliance registration. The policy must be disabled for this machine.")
+        } else {
+            Write-Host "  [PASS] Command prompt access policy is not blocking appliance operations." -ForegroundColor Green
+            [void]$result.Checks.Add([PSCustomObject]@{ Check = 'DisableCMD'; Status = 'PASS'; Detail = "Not restricted" })
+        }
+    } catch {
+        Write-Host "  [INFO] Could not check command prompt policy: $($_.Exception.Message)" -ForegroundColor Gray
+    }
+
+    # 3. Trust logic for attachments
+    Write-Host ""
+    Write-Host "  Checking: Trust logic for file attachments policy..." -ForegroundColor White
+    try {
+        $regPath3 = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Attachments'
+        $val3 = (Get-ItemProperty -Path $regPath3 -Name 'UseTrustedHandlers' -ErrorAction SilentlyContinue).UseTrustedHandlers
+        if ($null -ne $val3 -and $val3 -eq 3) {
+            Write-Host "  [FAIL] Group Policy 'Trust logic for file attachments' is set to block (UseTrustedHandlers=3)." -ForegroundColor Red
+            Write-Host "  This policy prevents the appliance from opening and using downloaded files." -ForegroundColor Red
+            Write-Host "  It must be changed to allow the appliance to function correctly." -ForegroundColor Yellow
+            [void]$result.Checks.Add([PSCustomObject]@{ Check = 'UseTrustedHandlers'; Status = 'FAIL'; Detail = "UseTrustedHandlers=3 — file attachment trust policy is blocking appliance" })
+            $result.AllPass = $false
+            [void]$script:Recommendations.Add("GROUP POLICY BLOCK: 'Trust logic for file attachments' set to 3 (blocked). This prevents the appliance from using installer files. The policy must be changed for this machine.")
+        } else {
+            Write-Host "  [PASS] File attachment trust policy is not blocking appliance operations." -ForegroundColor Green
+            [void]$result.Checks.Add([PSCustomObject]@{ Check = 'UseTrustedHandlers'; Status = 'PASS'; Detail = "Not restricted" })
+        }
+    } catch {
+        Write-Host "  [INFO] Could not check file attachment policy: $($_.Exception.Message)" -ForegroundColor Gray
+    }
+
+    # 4. PowerShell execution policy
+    Write-Host ""
+    Write-Host "  Checking: PowerShell execution policy..." -ForegroundColor White
+    try {
+        $psPolicy = Get-ExecutionPolicy -Scope LocalMachine -ErrorAction SilentlyContinue
+        if ($psPolicy -in @('AllSigned', 'Restricted')) {
+            Write-Host "  [FAIL] PowerShell execution policy is '$psPolicy'." -ForegroundColor Red
+            Write-Host "  The Appliance Configuration Manager requires PowerShell scripts to run." -ForegroundColor Red
+            Write-Host "  Policy must NOT be 'AllSigned' or 'Restricted'." -ForegroundColor Yellow
+            Write-Host "  Ask your security team to set it to 'RemoteSigned' for this machine." -ForegroundColor Yellow
+            [void]$result.Checks.Add([PSCustomObject]@{ Check = 'PSExecutionPolicy'; Status = 'FAIL'; Detail = "Execution policy is '$psPolicy' — appliance registration requires RemoteSigned or less restrictive" })
+            $result.AllPass = $false
+            [void]$script:Recommendations.Add("GROUP POLICY BLOCK: PowerShell execution policy is '$psPolicy'. The Appliance Configuration Manager requires it to be RemoteSigned or less restrictive. Ask your security team to apply an exception for this machine.")
+        } else {
+            Write-Host "  [PASS] PowerShell execution policy is '$psPolicy' — appliance can run scripts." -ForegroundColor Green
+            [void]$result.Checks.Add([PSCustomObject]@{ Check = 'PSExecutionPolicy'; Status = 'PASS'; Detail = "Execution policy: $psPolicy" })
+        }
+    } catch {
+        Write-Host "  [INFO] Could not determine PowerShell execution policy: $($_.Exception.Message)" -ForegroundColor Gray
+    }
+
+    # 5. IIS Web Server role (port 443 conflict)
+    Write-Host ""
+    Write-Host "  Checking: IIS Web Server role conflict..." -ForegroundColor White
+    try {
+        $iis = Get-WindowsFeature -Name 'Web-Server' -ErrorAction SilentlyContinue
+        if ($iis -and $iis.Installed) {
+            Write-Host "  [WARN] IIS (Internet Information Services) is installed on this machine." -ForegroundColor Yellow
+            Write-Host "  The Appliance Configuration Manager web portal uses port 443." -ForegroundColor Yellow
+            Write-Host "  If IIS has a site listening on port 443, the appliance registration will fail." -ForegroundColor Yellow
+            Write-Host "  Check IIS Manager to ensure no site is bound to port 443." -ForegroundColor White
+            [void]$result.Checks.Add([PSCustomObject]@{ Check = 'IIS_Conflict'; Status = 'WARN'; Detail = "IIS is installed — verify no site is bound to port 443" })
+            [void]$script:Warnings.Add("IIS is installed on this machine. Ensure no IIS website is bound to port 443 — the Appliance Configuration Manager requires this port.")
+        } else {
+            Write-Host "  [PASS] IIS Web Server role is not installed — no port 443 conflict." -ForegroundColor Green
+            [void]$result.Checks.Add([PSCustomObject]@{ Check = 'IIS_Conflict'; Status = 'PASS'; Detail = "IIS not installed" })
+        }
+    } catch {
+        # Get-WindowsFeature may not be available on non-Server OS — skip gracefully
+        Write-Host "  [INFO] Could not check IIS role (may not be available on this OS edition)." -ForegroundColor Gray
+    }
+
+    # Summary
+    Write-Host ""
+    if ($result.AllPass) {
+        Write-Host "  [PASS] All Group Policy prerequisites are met." -ForegroundColor Green
+        Write-Host "  The Appliance Configuration Manager should be able to register without policy blocks." -ForegroundColor Green
+    } else {
+        Write-Host "  [FAIL] One or more Group Policy prerequisites failed." -ForegroundColor Red
+        Write-Host "  These issues WILL prevent appliance registration, regardless of network health." -ForegroundColor Red
+        Write-Host "  Contact your Windows/Group Policy administrator to resolve these settings." -ForegroundColor Yellow
+    }
+
+    $script:GroupPolicyResult = $result
+    Write-Host ""
+}
+
+# ============================================================================
+# TEST-AVEXCLUSIONPATHS — v5.0 addition
+# ============================================================================
+function Test-AvExclusionPaths {
+    param(
+        [ValidateSet('VMwareAgentless','AgentBasedLegacy','AgentBasedModern')]
+        [string]$Scenario
+    )
+
+    Write-Section "ANTIVIRUS EXCLUSION PATHS — REQUIRED FOLDERS (Read-Only Check)"
+    Write-Host ""
+    Write-Host "  WHY THESE FOLDERS MUST BE EXCLUDED FROM ANTIVIRUS SCANNING:" -ForegroundColor Yellow
+    Write-Host "  ─────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+    Write-Host "  Azure Migrate stores live replication data, logs, and agent executables" -ForegroundColor White
+    Write-Host "  in the folders listed below. If your antivirus product scans or locks" -ForegroundColor White
+    Write-Host "  these files during active operations, it can cause:" -ForegroundColor White
+    Write-Host ""
+    Write-Host "    - Corrupt in-flight replication data → replication fails silently" -ForegroundColor Red
+    Write-Host "    - Locked agent executables → Azure Migrate services cannot start" -ForegroundColor Red
+    Write-Host "    - Quarantined mobility agent installers → cannot push agent to source VMs" -ForegroundColor Red
+    Write-Host "    - False-positive detections on legitimate Azure migration network traffic" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  This is one of the top causes of Azure Migrate failures in environments" -ForegroundColor Yellow
+    Write-Host "  with active endpoint security products (CrowdStrike, Defender, SentinelOne etc.)" -ForegroundColor Yellow
+    Write-Host ""
+
+    # Core appliance exclusion paths — required for ALL scenarios
+    $applianceExclusions = @(
+        [PSCustomObject]@{ Path = 'C:\ProgramData\Microsoft Azure';                                    Reason = 'Appliance logs, temp data, and replication state files — actively written during all operations' }
+        [PSCustomObject]@{ Path = 'C:\ProgramData\ASRLogs';                                            Reason = 'Azure Site Recovery diagnostic logs — must not be locked during log write operations' }
+        [PSCustomObject]@{ Path = 'C:\Windows\Temp\MicrosoftAzure';                                    Reason = 'Temporary working files used during appliance operations and updates' }
+        [PSCustomObject]@{ Path = 'C:\Program Files\Microsoft Azure Appliance Auto Update';            Reason = 'Auto-update agent executables — AV must not block or quarantine update packages' }
+        [PSCustomObject]@{ Path = 'C:\Program Files\Microsoft Azure Appliance Configuration Manager'; Reason = 'Config Manager web application files — must run without interference' }
+        [PSCustomObject]@{ Path = 'C:\Program Files\Microsoft Azure Push Install Agent';               Reason = 'Mobility agent push installer — AV MUST NOT quarantine this; it pushes agents to source VMs' }
+        [PSCustomObject]@{ Path = 'C:\Program Files\Microsoft Azure RCM Proxy Agent';                  Reason = 'Replication proxy agent — handles communication between appliance and Azure' }
+        [PSCustomObject]@{ Path = 'C:\Program Files\Microsoft Azure Recovery Services Agent';          Reason = 'Recovery services agent binaries — actively used during replication' }
+        [PSCustomObject]@{ Path = 'C:\Program Files\Microsoft Azure Server Discovery Service';         Reason = 'Discovery service executables — scans source VMs for inventory data' }
+        [PSCustomObject]@{ Path = 'C:\Program Files\Microsoft Azure Site Recovery Process Server';     Reason = 'CRITICAL: Process server handles all replication data flows — AV scanning can corrupt data mid-transfer' }
+        [PSCustomObject]@{ Path = 'C:\Program Files\Microsoft Azure Site Recovery Provider';           Reason = 'Site Recovery provider agent — communicates with Azure Site Recovery service' }
+        [PSCustomObject]@{ Path = 'C:\Program Files\Microsoft Azure to on-premises Reprotect agent';  Reason = 'Reprotect agent used for failback scenarios' }
+        [PSCustomObject]@{ Path = 'C:\Program Files\Microsoft Azure VMware Discovery Service';         Reason = 'VMware-specific discovery agent — reads vCenter and ESXi metadata' }
+        [PSCustomObject]@{ Path = 'C:\Program Files\Microsoft on-premises to Azure Replication agent'; Reason = 'CRITICAL: Core replication agent — AV must not scan during active replication data transfers' }
+        [PSCustomObject]@{ Path = 'E:\';                                                               Reason = 'Replication cache data disk — entire drive must be excluded; active replication writes large data blocks here continuously' }
+    )
+
+    Write-Host "  REQUIRED EXCLUSIONS — ALL SCENARIOS" -ForegroundColor White
+    Write-Host "  ─────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+    Write-Host ""
+
+    $pathsFound    = 0
+    $pathsNotFound = 0
+    $criticalMissing = [System.Collections.ArrayList]::new()
+
+    foreach ($excl in $applianceExclusions) {
+        $exists = Test-Path -Path $excl.Path -ErrorAction SilentlyContinue
+        if ($exists) {
+            $pathsFound++
+            Write-Host "  [EXISTS] $($excl.Path)" -ForegroundColor Green
+        } else {
+            $pathsNotFound++
+            Write-Host "  [NOT FOUND] $($excl.Path)" -ForegroundColor Gray
+        }
+        Write-Host "           → $($excl.Reason)" -ForegroundColor Gray
+        Write-Host ""
+
+        if ($exists -and $excl.Path -match 'Process Server|Replication agent') {
+            [void]$criticalMissing.Add($excl.Path)
+        }
+    }
+
+    # VMware Agentless specific
+    if ($Scenario -eq 'VMwareAgentless') {
+        Write-Host ""
+        Write-Host "  ADDITIONAL EXCLUSION — VMWARE AGENTLESS ONLY" -ForegroundColor Yellow
+        Write-Host "  ─────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+        Write-Host ""
+        $vddkPath = 'C:\Program Files (x86)\VMware\VMware vSphere VDDK'
+        $vddkExists = Test-Path -Path $vddkPath -ErrorAction SilentlyContinue
+        $vddkStatus = if ($vddkExists) { "[EXISTS]" } else { "[NOT FOUND]" }
+        $vddkColor  = if ($vddkExists) { "Green" } else { "Gray" }
+        Write-Host "  $vddkStatus $vddkPath" -ForegroundColor $vddkColor
+        Write-Host "           → VDDK (Virtual Disk Development Kit) libraries used to read VM disk data" -ForegroundColor Gray
+        Write-Host "             during agentless migration. AV scanning this folder causes VDDK" -ForegroundColor Gray
+        Write-Host "             initialization failure — agentless replication will not start." -ForegroundColor Gray
+        Write-Host ""
+        if (-not $vddkExists) {
+            Write-Host "  [INFO] VDDK folder not found. VDDK must be installed on this appliance" -ForegroundColor Yellow
+            Write-Host "  before agentless migration can run." -ForegroundColor Yellow
+            [void]$script:Warnings.Add("VDDK not found at $vddkPath. VMware agentless migration requires VDDK to be installed. Download from VMware Customer Connect.")
+        }
+    }
+
+    # Simplified Experience (AgentBasedModern) — source VM note
+    if ($Scenario -eq 'AgentBasedModern') {
+        Write-Host ""
+        Write-Host "  ADDITIONAL EXCLUSION — ON EACH SOURCE VM BEING MIGRATED" -ForegroundColor Yellow
+        Write-Host "  ─────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "  Path to exclude on SOURCE MACHINES (not this appliance):" -ForegroundColor White
+        Write-Host "  C:\Program Files (x86)\Microsoft Azure Site Recovery\" -ForegroundColor Cyan
+        Write-Host "  → This is where the Mobility Service agent is installed on VMs being replicated." -ForegroundColor Gray
+        Write-Host "    If the AV product on source machines quarantines mobility agent files during" -ForegroundColor Gray
+        Write-Host "    push installation or active replication, replication will fail or stall." -ForegroundColor Gray
+        Write-Host "  → Ensure your AV team adds this exclusion to the policy applied to source VMs." -ForegroundColor Yellow
+        Write-Host ""
+    }
+
+    # AV product-specific guidance (if AV was detected earlier)
+    if ($null -ne $script:AvEdrResult -and $script:AvEdrResult.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  HOW TO ADD EXCLUSIONS FOR DETECTED AV PRODUCTS:" -ForegroundColor Yellow
+        Write-Host "  ─────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+        Write-Host ""
+
+        foreach ($av in $script:AvEdrResult) {
+            $avName = $av.Product
+            Write-Host "  $avName :" -ForegroundColor White
+            switch -Wildcard ($avName) {
+                '*CrowdStrike*' {
+                    Write-Host "    1. Log in to CrowdStrike Falcon Console (falcon.crowdstrike.com)" -ForegroundColor Gray
+                    Write-Host "    2. Go to: Configuration > Prevention Policy > your policy > Exclusions" -ForegroundColor Gray
+                    Write-Host "    3. Add each folder path above as a 'Never Block' exclusion" -ForegroundColor Gray
+                    Write-Host "    4. IMPORTANT: Also add VDDK path if running VMware agentless migration" -ForegroundColor Gray
+                }
+                '*Defender*' {
+                    Write-Host "    Run in PowerShell (Admin) — one command per path:" -ForegroundColor Gray
+                    Write-Host "    Add-MpPreference -ExclusionPath 'C:\ProgramData\Microsoft Azure'" -ForegroundColor Cyan
+                    Write-Host "    Add-MpPreference -ExclusionPath 'C:\Program Files\Microsoft Azure Site Recovery Process Server'" -ForegroundColor Cyan
+                    Write-Host "    (Repeat for each path listed above)" -ForegroundColor Gray
+                }
+                '*SentinelOne*' {
+                    Write-Host "    1. Log in to SentinelOne Management Console" -ForegroundColor Gray
+                    Write-Host "    2. Go to: Exclusions > Path Exclusions" -ForegroundColor Gray
+                    Write-Host "    3. Add each folder path with mode 'Suppression'" -ForegroundColor Gray
+                }
+                '*Carbon Black*' {
+                    Write-Host "    1. Log in to Carbon Black Cloud or CBC console" -ForegroundColor Gray
+                    Write-Host "    2. Go to: Policies > your policy > Prevention > Exclusions" -ForegroundColor Gray
+                    Write-Host "    3. Add folder path exclusions for each path above" -ForegroundColor Gray
+                }
+                default {
+                    Write-Host "    Consult your $avName vendor documentation to add folder path exclusions." -ForegroundColor Gray
+                    Write-Host "    Reference: https://learn.microsoft.com/en-us/azure/site-recovery/replication-appliance-support-matrix#folder-exclusions-from-antivirus-programs" -ForegroundColor Cyan
+                }
+            }
+            Write-Host ""
+        }
+    } else {
+        Write-Host ""
+        Write-Host "  No AV/EDR products were detected on this machine." -ForegroundColor Green
+        Write-Host "  If AV is managed centrally (not visible from this machine), ensure" -ForegroundColor Gray
+        Write-Host "  your AV team adds the exclusions above to the policy for this machine." -ForegroundColor Gray
+        Write-Host ""
+    }
+
+    # Summary
+    Write-Host "  SUMMARY" -ForegroundColor White
+    Write-Host "  ─────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+    if ($pathsFound -gt 0) {
+        Write-Host "  $pathsFound path(s) found on this machine — add these to your AV exclusion list." -ForegroundColor Yellow
+        Write-Host "  $pathsNotFound path(s) not found (not installed yet or different path)." -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "  Full Microsoft documentation:" -ForegroundColor White
+        Write-Host "  https://learn.microsoft.com/en-us/azure/site-recovery/replication-appliance-support-matrix#folder-exclusions-from-antivirus-programs" -ForegroundColor Cyan
+        [void]$script:Recommendations.Add("AV EXCLUSIONS NEEDED: $pathsFound Azure Migrate folders found on this machine. Add them all to your AV/EDR exclusion list to prevent replication failures. See: https://learn.microsoft.com/en-us/azure/site-recovery/replication-appliance-support-matrix#folder-exclusions-from-antivirus-programs")
+    } else {
+        Write-Host "  None of the standard Azure Migrate folders were found on this machine." -ForegroundColor Gray
+        Write-Host "  This is expected if the appliance software is not yet installed." -ForegroundColor Gray
+        Write-Host "  Once installed, add the paths above to your AV exclusion list BEFORE" -ForegroundColor Yellow
+        Write-Host "  running the first replication." -ForegroundColor Yellow
+    }
+
+    $script:AvExclusionResult = @{
+        PathsFound    = $pathsFound
+        PathsNotFound = $pathsNotFound
+        Scenario      = $Scenario
+    }
+    Write-Host ""
+}
+
 function Main {
     Clear-Host
     Write-Banner
@@ -5425,6 +5773,9 @@ function Main {
         # ----- Local Firewall -----
         Test-LocalFirewall
 
+        # ----- Group Policy Prerequisites (v5.0) -----
+        Test-GroupPolicyPrereqs
+
         # ----- Basic Connectivity -----
         Test-BasicConnectivity
 
@@ -5523,6 +5874,9 @@ function Main {
 
         # ----- AV/EDR Detection (v5.0) -----
         Test-AntivirusInterference
+
+        # ----- AV Exclusion Paths (v5.0) -----
+        Test-AvExclusionPaths -Scenario $scenario
 
         # ----- Executive Summary (v3.0) -----
         Write-ExecutiveSummary -Cloud $cloud -ConnectivityPath $connectivityPath
