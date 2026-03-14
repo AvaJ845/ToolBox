@@ -2850,6 +2850,10 @@ function Write-NextSteps {
     Write-Host "  These steps are generated specifically based on what was found in this run." -ForegroundColor Gray
     Write-Host "  Only issues that were actually detected are listed here." -ForegroundColor Gray
     Write-Host ""
+    Write-Host "  NOTE: This script finished in under 5 minutes. The times shown below are" -ForegroundColor White
+    Write-Host "  how long it will take your team to FIX each issue — not how long this" -ForegroundColor White
+    Write-Host "  script took to run." -ForegroundColor White
+    Write-Host ""
 
     $stepNum = 0
 
