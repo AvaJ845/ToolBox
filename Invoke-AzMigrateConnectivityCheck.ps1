@@ -254,23 +254,208 @@ function Add-TestResult {
         [string]$TcpDetail,
         [bool]$HttpsPass,
         [string]$HttpsDetail,
-        [string]$Category
+        [string]$Category,
+        [string]$NicContext        = '',
+        [string]$RetryConsistency  = '',
+        [string]$NextCheckCommand  = ''
     )
     $overall = $DnsPass -and $TcpPass -and $HttpsPass
     [void]$script:TestResults.Add([PSCustomObject]@{
-        Url             = $Url
-        Port            = $Port
-        Purpose         = $Purpose
-        WildcardPattern = $WildcardPattern
-        DnsPass         = $DnsPass
-        DnsDetail       = $DnsDetail
-        TcpPass         = $TcpPass
-        TcpDetail       = $TcpDetail
-        HttpsPass       = $HttpsPass
-        HttpsDetail     = $HttpsDetail
-        OverallPass     = $overall
-        Category        = $Category
+        Url               = $Url
+        Port              = $Port
+        Purpose           = $Purpose
+        WildcardPattern   = $WildcardPattern
+        DnsPass           = $DnsPass
+        DnsDetail         = $DnsDetail
+        TcpPass           = $TcpPass
+        TcpDetail         = $TcpDetail
+        HttpsPass         = $HttpsPass
+        HttpsDetail       = $HttpsDetail
+        OverallPass       = $overall
+        Category          = $Category
+        NicContext        = $NicContext
+        RetryConsistency  = $RetryConsistency
+        NextCheckCommand  = $NextCheckCommand
     })
+}
+
+# ============================================================================
+# FAILURE CONTEXT HELPERS  (Feature 8 — Failure Context in Report)
+# ============================================================================
+
+function Get-NetworkInterfaceContext {
+    <#
+    .SYNOPSIS
+        Returns which active NIC(s) would be used to reach the given host, based
+        on the routing table.  When multiple NICs are present the function
+        identifies the best-matching route and reports the adapter name, IP,
+        and gateway so the operator knows exactly which interface was exercised.
+    #>
+    param([string]$HostName)
+
+    $result = @{
+        AdapterName  = 'Unknown'
+        AdapterIP    = 'Unknown'
+        Gateway      = 'Unknown'
+        MultipleNics = $false
+        Detail       = ''
+    }
+
+    try {
+        # Enumerate all active adapters
+        $activeAdapters = Get-NetAdapter -ErrorAction SilentlyContinue |
+            Where-Object { $_.Status -eq 'Up' }
+
+        if (-not $activeAdapters) {
+            $result.Detail = 'No active network adapters found'
+            return $result
+        }
+
+        $result.MultipleNics = ($activeAdapters.Count -gt 1)
+
+        # Resolve destination IP (best-effort; use first A record)
+        $destIp = $null
+        try {
+            $addrs = [System.Net.Dns]::GetHostAddresses($HostName) |
+                Where-Object { $_.AddressFamily -eq 'InterNetwork' }
+            if ($addrs) { $destIp = $addrs[0].IPAddressToString }
+        } catch {}
+
+        # Find the best-matching route for the destination
+        $bestRoute = $null
+        if ($destIp) {
+            # Get all IPv4 routes, pick the one whose destination prefix contains $destIp
+            # (longest prefix match — sort by prefix length desc, pick first match)
+            $routes = Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                Sort-Object -Property { $_.DestinationPrefix.Split('/')[1] -as [int] } -Descending
+
+            foreach ($route in $routes) {
+                $prefix = $route.DestinationPrefix
+                # Quick CIDR match
+                try {
+                    $parts = $prefix.Split('/')
+                    $netAddr = [System.Net.IPAddress]::Parse($parts[0])
+                    $prefixLen = [int]$parts[1]
+                    $mask = if ($prefixLen -eq 0) { 0 } else { ([uint32]0xFFFFFFFF) -shl (32 - $prefixLen) }
+                    $netInt  = [BitConverter]::ToUInt32(([byte[]]($netAddr.GetAddressBytes() | Select-Object -Last 4) | ForEach-Object { $_ })[ 3..0 ], 0)
+                    $destInt = [BitConverter]::ToUInt32(([byte[]]([System.Net.IPAddress]::Parse($destIp).GetAddressBytes() | Select-Object -Last 4) | ForEach-Object { $_ })[ 3..0 ], 0)
+                    if (($destInt -band $mask) -eq ($netInt -band $mask)) {
+                        $bestRoute = $route
+                        break
+                    }
+                } catch {}
+            }
+        }
+
+        # Fall back to the default route if no specific match found
+        if (-not $bestRoute) {
+            $bestRoute = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+                Sort-Object RouteMetric | Select-Object -First 1
+        }
+
+        if ($bestRoute) {
+            $ifIndex = $bestRoute.InterfaceIndex
+            $adapter = $activeAdapters | Where-Object { $_.ifIndex -eq $ifIndex } | Select-Object -First 1
+            if ($adapter) {
+                $ipConfig = Get-NetIPAddress -InterfaceIndex $ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+                $result.AdapterName = "$($adapter.Name) [$($adapter.InterfaceDescription)]"
+                $result.AdapterIP   = if ($ipConfig) { $ipConfig.IPAddress } else { 'Unknown' }
+                $result.Gateway     = if ($bestRoute.NextHop -and $bestRoute.NextHop -ne '0.0.0.0') { $bestRoute.NextHop } else { 'Direct/None' }
+            }
+        }
+
+        # Build human-readable detail
+        if ($result.MultipleNics) {
+            $allNames = ($activeAdapters | ForEach-Object { $_.Name }) -join ', '
+            $result.Detail = "Multiple NICs detected ($allNames). Traffic routed via: $($result.AdapterName) (IP: $($result.AdapterIP), GW: $($result.Gateway))"
+        } else {
+            $result.Detail = "NIC: $($result.AdapterName) (IP: $($result.AdapterIP), GW: $($result.Gateway))"
+        }
+    } catch {
+        $result.Detail = "Could not determine NIC context: $($_.Exception.Message)"
+    }
+
+    return $result
+}
+
+function Test-FailureConsistency {
+    <#
+    .SYNOPSIS
+        Retries a DNS or TCP test up to $RetryCount times to determine whether
+        the failure is consistent (always fails) or intermittent (sometimes passes).
+        Returns a hashtable with Consistent (bool) and Detail (string).
+    #>
+    param(
+        [ValidateSet('DNS','TCP')]
+        [string]$TestType,
+        [string]$HostName,
+        [int]$Port         = 443,
+        [int]$RetryCount   = 2,
+        [int]$DelayMs      = 1500
+    )
+
+    $passes  = 0
+    $fails   = 0
+
+    for ($i = 0; $i -lt $RetryCount; $i++) {
+        if ($i -gt 0) { Start-Sleep -Milliseconds $DelayMs }
+
+        if ($TestType -eq 'DNS') {
+            $r = Test-DnsResolution -HostName $HostName
+            if ($r.Success) { $passes++ } else { $fails++ }
+        } else {
+            $r = Test-TcpPort -HostName $HostName -Port $Port
+            if ($r.Success) { $passes++ } else { $fails++ }
+        }
+    }
+
+    $consistent = ($passes -eq 0)   # all retries failed
+    $detail = if ($consistent) {
+        "Consistent failure — failed all $RetryCount retries (not intermittent)"
+    } elseif ($fails -eq 0) {
+        "Passed on retry — failure may be intermittent or transient"
+    } else {
+        "Intermittent — passed $passes / $($RetryCount) retries (flapping connection)"
+    }
+
+    return @{ Consistent = $consistent; Detail = $detail; Passes = $passes; Fails = $fails }
+}
+
+function Get-FailureContextSuggestion {
+    <#
+    .SYNOPSIS
+        Generates a concrete, copy-paste-ready PowerShell command to immediately
+        follow up on a DNS or TCP failure, plus a plain-English explanation of
+        what the command will prove.
+    #>
+    param(
+        [string]$HostName,
+        [int]$Port,
+        [bool]$DnsFailed,
+        [bool]$TcpFailed
+    )
+
+    if ($DnsFailed) {
+        return @{
+            Command     = "Resolve-DnsName -Name '$HostName' -Verbose"
+            Explanation = "Run this to see exactly which DNS server responds and what error it returns. " +
+                          "If it returns NXDOMAIN or no address, your DNS server is filtering this domain. " +
+                          "Compare with: Resolve-DnsName -Name '$HostName' -Server 8.8.8.8 -DnsOnly"
+        }
+    } elseif ($TcpFailed) {
+        return @{
+            Command     = "Test-NetConnection -ComputerName '$HostName' -Port $Port -InformationLevel Detailed"
+            Explanation = "Run this to confirm the TCP block and see the exact failure mode. " +
+                          "TcpTestSucceeded=False + PingSucceeded=False usually means a firewall is dropping packets. " +
+                          "TcpTestSucceeded=False + PingSucceeded=True usually means port $Port is specifically blocked."
+        }
+    } else {
+        return @{
+            Command     = "Invoke-WebRequest -Uri 'https://$HostName' -UseBasicParsing -Verbose"
+            Explanation = "Run this to see the full HTTP/TLS exchange and the specific HTTPS error returned."
+        }
+    }
 }
 
 # ============================================================================
@@ -977,12 +1162,47 @@ function Invoke-ConnectivityTests {
             Write-Host "FAIL (HTTPS)" -ForegroundColor Red
         }
 
+        # ----------------------------------------------------------------
+        # Feature 8: Failure Context — only collected for failed endpoints
+        # ----------------------------------------------------------------
+        $nicContext       = ''
+        $retryConsistency = ''
+        $nextCheckCmd     = ''
+
+        if (-not $overall) {
+            # (a) Which NIC was used?
+            $nicInfo    = Get-NetworkInterfaceContext -HostName $host_
+            $nicContext = $nicInfo.Detail
+
+            # (b) Is the failure consistent across retries?
+            if (-not $dnsPass) {
+                $retry            = Test-FailureConsistency -TestType 'DNS' -HostName $host_ -RetryCount 2
+                $retryConsistency = $retry.Detail
+            } elseif (-not $tcpPass) {
+                $retry            = Test-FailureConsistency -TestType 'TCP' -HostName $host_ -Port $port -RetryCount 2
+                $retryConsistency = $retry.Detail
+            }
+
+            # (c) Suggested next immediate check
+            $suggestion   = Get-FailureContextSuggestion -HostName $host_ -Port $port `
+                                -DnsFailed (-not $dnsPass) -TcpFailed (-not $tcpPass -and $dnsPass)
+            $nextCheckCmd = $suggestion.Command
+
+            # Print inline failure context (brief — full detail is in report/summary)
+            Write-Host "        [NIC]     $nicContext" -ForegroundColor DarkGray
+            Write-Host "        [RETRY]   $retryConsistency" -ForegroundColor DarkGray
+            Write-Host "        [CHECK]   $nextCheckCmd" -ForegroundColor DarkGray
+        }
+
         # Store result
         Add-TestResult -Url $host_ -Port $port -Purpose $entry.Purpose -WildcardPattern $entry.Wildcard `
             -DnsPass $dnsPass -DnsDetail $dnsDetail `
             -TcpPass $tcpPass -TcpDetail $tcpDetail `
             -HttpsPass $httpsPass -HttpsDetail $httpsDetail `
-            -Category $entry.Category
+            -Category $entry.Category `
+            -NicContext $nicContext `
+            -RetryConsistency $retryConsistency `
+            -NextCheckCommand $nextCheckCmd
     }
 }
 
@@ -1109,6 +1329,15 @@ function Write-ResultsSummary {
             Write-Host "               Error: $($f.DnsDetail)" -ForegroundColor DarkGray
             Write-Host "               NOTE: Wildcard base domains may not resolve directly." -ForegroundColor DarkGray
             Write-Host "               Ensure '$($f.WildcardPattern)' is resolvable from your DNS." -ForegroundColor DarkGray
+            if ($f.NicContext) {
+                Write-Host "               NIC Used: $($f.NicContext)" -ForegroundColor DarkYellow
+            }
+            if ($f.RetryConsistency) {
+                Write-Host "               Retry Result: $($f.RetryConsistency)" -ForegroundColor DarkYellow
+            }
+            if ($f.NextCheckCommand) {
+                Write-Host "               Next Check: $($f.NextCheckCommand)" -ForegroundColor Cyan
+            }
         }
         Write-Host ""
     }
@@ -1120,6 +1349,15 @@ function Write-ResultsSummary {
             Write-Host "                  Wildcard: $($f.WildcardPattern)" -ForegroundColor DarkGray
             Write-Host "                  Resolved IP: $($f.DnsDetail)" -ForegroundColor DarkGray
             Write-Host "                  Error: $($f.TcpDetail)" -ForegroundColor DarkGray
+            if ($f.NicContext) {
+                Write-Host "                  NIC Used: $($f.NicContext)" -ForegroundColor DarkYellow
+            }
+            if ($f.RetryConsistency) {
+                Write-Host "                  Retry Result: $($f.RetryConsistency)" -ForegroundColor DarkYellow
+            }
+            if ($f.NextCheckCommand) {
+                Write-Host "                  Next Check: $($f.NextCheckCommand)" -ForegroundColor Cyan
+            }
         }
         Write-Host ""
         [void]$script:Recommendations.Add(@"
@@ -1424,6 +1662,11 @@ function Export-Report {
         [void]$sb.AppendLine("         DNS:      $(if ($r.DnsPass) {'PASS'} else {'FAIL'}) - $($r.DnsDetail)")
         [void]$sb.AppendLine("         TCP:      $(if ($r.TcpPass) {'PASS'} else {'FAIL'}) - $($r.TcpDetail)")
         [void]$sb.AppendLine("         HTTPS:    $(if ($r.HttpsPass) {'PASS'} else {'FAIL'}) - $($r.HttpsDetail)")
+        if (-not $r.OverallPass) {
+            if ($r.NicContext)       { [void]$sb.AppendLine("         NIC Used: $($r.NicContext)") }
+            if ($r.RetryConsistency) { [void]$sb.AppendLine("         Retry:    $($r.RetryConsistency)") }
+            if ($r.NextCheckCommand) { [void]$sb.AppendLine("         Next Check Command:") ; [void]$sb.AppendLine("           $($r.NextCheckCommand)") }
+        }
         [void]$sb.AppendLine("")
     }
 
@@ -1446,6 +1689,26 @@ function Export-Report {
                 [void]$sb.AppendLine("  Root Cause: HTTPS/TLS failure (TCP connected successfully)")
                 [void]$sb.AppendLine("  Action: Check for SSL inspection, proxy auth, or TLS version issues")
                 [void]$sb.AppendLine("  HTTPS Error: $($f.HttpsDetail)")
+            }
+            # ---- Feature 8: Failure Context ----
+            [void]$sb.AppendLine("")
+            [void]$sb.AppendLine("  --- Failure Context ---")
+            if ($f.NicContext) {
+                [void]$sb.AppendLine("  Network Interface Used:")
+                [void]$sb.AppendLine("    $($f.NicContext)")
+            }
+            if ($f.RetryConsistency) {
+                [void]$sb.AppendLine("  Retry Consistency:")
+                [void]$sb.AppendLine("    $($f.RetryConsistency)")
+            }
+            if ($f.NextCheckCommand) {
+                [void]$sb.AppendLine("  Suggested Next Immediate Check:")
+                [void]$sb.AppendLine("    Run this command on the appliance to confirm the failure:")
+                [void]$sb.AppendLine("      $($f.NextCheckCommand)")
+                # Embed the explanation from the helper
+                $sug = Get-FailureContextSuggestion -HostName $f.Url -Port $f.Port `
+                           -DnsFailed (-not $f.DnsPass) -TcpFailed ($f.DnsPass -and -not $f.TcpPass)
+                [void]$sb.AppendLine("    What it proves: $($sug.Explanation)")
             }
         }
     }
