@@ -24,20 +24,23 @@
     THIS SCRIPT MAKES NO CHANGES TO THE ENVIRONMENT. It only reads configuration and tests connectivity.
 
     Supports:
-    - Commercial Azure and Azure Government cloud
+    - Commercial Azure, Azure Government, and Azure China (21Vianet)
     - VMware Agentless, Agent-based Legacy, Agent-based Modern appliance scenarios
     - Assessment/Discovery and Replication appliance types
+    - VMware vSphere, Hyper-V, and Physical/Other Cloud source platforms
     - Public endpoint and Private Link connectivity
+    - Direct internet, proxy, ExpressRoute, and VPN Gateway connectivity paths
     - Proxy and firewall detection and reporting
 
 .NOTES
-    Version:  1.0
+    Version:  2.0
     Requires: PowerShell 5.1+
     Author:   Azure Migrate Connectivity Checker (generated diagnostic tool)
 
 .LINK
     https://learn.microsoft.com/en-us/azure/migrate/migrate-appliance
     https://learn.microsoft.com/en-us/azure/migrate/simplified-experience-for-azure-migrate
+    https://learn.microsoft.com/en-us/azure/migrate/migrate-appliance-china
 #>
 
 [CmdletBinding()]
@@ -51,9 +54,9 @@ $ProgressPreference    = 'SilentlyContinue'
 $script:TestResults    = [System.Collections.ArrayList]::new()
 $script:Recommendations = [System.Collections.ArrayList]::new()
 $script:Warnings       = [System.Collections.ArrayList]::new()
-$script:ScriptVersion  = '1.0'
+$script:ScriptVersion  = '2.0'
 $script:TcpTimeoutMs   = 5000
-$script:HttpTimeoutMs   = 10000
+$script:HttpTimeoutMs  = 10000
 $script:ReportPath     = Join-Path $PSScriptRoot ("AzMigrate-ConnectivityReport_{0}.txt" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
 
 # Force TLS 1.2 (required by Azure services)
@@ -71,6 +74,7 @@ function Write-Banner {
     $banner = @"
 ===============================================================================
   Azure Migrate Appliance - Connectivity Troubleshooter v$($script:ScriptVersion)
+  Supports: Commercial | Government | China (21Vianet)
 ===============================================================================
   This tool checks network connectivity required for Azure Migrate appliance
   registration and operation. It tests DNS resolution, TCP connectivity, and
@@ -198,7 +202,7 @@ function Test-HttpsConnectivity {
         $request.Method  = 'GET'
         $request.Timeout = $TimeoutMs
         $request.AllowAutoRedirect = $true
-        $request.UserAgent = 'AzureMigrateConnectivityChecker/1.0'
+        $request.UserAgent = 'AzureMigrateConnectivityChecker/2.0'
 
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $response = $request.GetResponse()
@@ -219,7 +223,6 @@ function Test-HttpsConnectivity {
         if ($webEx.Response) {
             # Got an HTTP response (401, 403, 404, etc.) - means network is reachable
             $result.StatusCode = [int]$webEx.Response.StatusCode
-            # 401/403/404 etc. means the endpoint is reachable (auth required or not found)
             if ($result.StatusCode -in @(400, 401, 403, 404, 405, 406, 409, 412, 500, 502, 503)) {
                 $result.Success = $true  # Network connectivity is working
             }
@@ -271,253 +274,197 @@ function Add-TestResult {
 }
 
 # ============================================================================
-# URL DEFINITIONS
+# URL DEFINITIONS  (v2.0 — authoritative MS docs endpoint lists)
 # ============================================================================
 
 function Get-UrlDefinitions {
     param(
-        [ValidateSet('Commercial','Government')]
+        [ValidateSet('Commercial','Government','China')]
         [string]$Cloud,
         [ValidateSet('VMwareAgentless','AgentBasedLegacy','AgentBasedModern')]
         [string]$Scenario,
         [ValidateSet('Assessment','Replication')]
         [string]$ApplianceType,
+        [ValidateSet('VMware','HyperV','Physical')]
+        [string]$Platform,
         [bool]$PrivateLink
     )
 
     $urls = [System.Collections.ArrayList]::new()
 
-    # ----- COMMERCIAL CLOUD -----
+    # Helper to add a URL entry
+    # Usage: Add-Url $urls 'host' 443 'wildcard' 'purpose' 'category'
+    function local:Add-Url {
+        param($list, $host_, $port, $wildcard, $purpose, $category)
+        [void]$list.Add(@{ Host=$host_; Port=$port; Wildcard=$wildcard; Purpose=$purpose; Category=$category })
+    }
+
+    # ========================================================================
+    # COMMERCIAL CLOUD
+    # ========================================================================
     if ($Cloud -eq 'Commercial') {
 
         if (-not $PrivateLink) {
-            # ==========================================
-            # PUBLIC CLOUD - PUBLIC ENDPOINTS
-            # ==========================================
+            # ----------------------------------------------------------------
+            # Commercial — Public endpoints
+            # ----------------------------------------------------------------
+            $cat = 'Core Services (All Appliances)'
+            local:Add-Url $urls 'portal.azure.com'                    443 '*.portal.azure.com'                    'Azure portal'                                        $cat
+            local:Add-Url $urls 'login.windows.net'                   443 '*.windows.net'                         'Microsoft Entra ID (access control)'                 $cat
+            local:Add-Url $urls 'msftauth.net'                        443 '*.msftauth.net'                        'Microsoft Entra ID'                                  $cat
+            local:Add-Url $urls 'msauth.net'                          443 '*.msauth.net'                          'Microsoft Entra ID'                                  $cat
+            local:Add-Url $urls 'www.microsoft.com'                   443 '*.microsoft.com'                       'Microsoft Entra ID'                                  $cat
+            local:Add-Url $urls 'login.live.com'                      443 '*.live.com'                            'Microsoft Entra ID'                                  $cat
+            local:Add-Url $urls 'login.microsoftonline.com'           443 '*.microsoftonline.com'                 'Microsoft Entra ID'                                  $cat
+            local:Add-Url $urls 'login.microsoftonline-p.com'         443 '*.microsoftonline-p.com'               'Microsoft Entra ID'                                  $cat
+            local:Add-Url $urls 'autologon.microsoftazuread-sso.com'  443 '*.microsoftazuread-sso.com'            'Microsoft Entra ID SSO'                              $cat
+            local:Add-Url $urls 'cloud.microsoft'                     443 '*.cloud.microsoft'                     'Microsoft Entra ID'                                  $cat
+            local:Add-Url $urls 'management.azure.com'                443 'management.azure.com'                  'Azure Resource Manager'                              $cat
+            local:Add-Url $urls 'dc.services.visualstudio.com'        443 '*.services.visualstudio.com'           'Appliance telemetry/logs'                            $cat
+            local:Add-Url $urls 'vault.azure.net'                     443 '*.vault.azure.net'                     'Azure Key Vault'                                     $cat
+            local:Add-Url $urls 'aka.ms'                              443 'aka.ms/*'                              'Appliance auto-update downloads'                     $cat
+            local:Add-Url $urls 'download.microsoft.com'              443 'download.microsoft.com/download'       'Microsoft downloads'                                 $cat
+            local:Add-Url $urls 'servicebus.windows.net'              443 '*.servicebus.windows.net'              'Azure Migrate service communication'                 $cat
+            local:Add-Url $urls 'discoverysrv.windowsazure.com'       443 '*.discoverysrv.windowsazure.com'       'Azure Migrate Discovery service'                     $cat
+            local:Add-Url $urls 'migration.windowsazure.com'          443 '*.migration.windowsazure.com'          'Azure Migrate Migration service'                     $cat
 
-            if ($ApplianceType -eq 'Assessment' -or $Scenario -eq 'VMwareAgentless') {
-                # Assessment/Discovery URLs (all scenarios)
-                $assessmentUrls = @(
-                    @{ Host='portal.azure.com';       Port=443; Purpose='Azure portal';                     Wildcard='*.portal.azure.com' }
-                    @{ Host='login.microsoftonline.com'; Port=443; Purpose='Azure AD authentication';       Wildcard='login.microsoftonline.com' }
-                    @{ Host='login.windows.net';      Port=443; Purpose='Azure AD authentication (alt)';    Wildcard='login.windows.net' }
-                    @{ Host='graph.windows.net';      Port=443; Purpose='Azure AD Graph';                   Wildcard='*.windows.net' }
-                    @{ Host='management.azure.com';   Port=443; Purpose='Azure Resource Manager';           Wildcard='management.azure.com' }
-                    @{ Host='dc.services.visualstudio.com'; Port=443; Purpose='Application Insights telemetry'; Wildcard='*.services.visualstudio.com' }
-                    @{ Host='vault.azure.net';        Port=443; Purpose='Azure Key Vault';                  Wildcard='*.vault.azure.net' }
-                    @{ Host='servicebus.windows.net'; Port=443; Purpose='Azure Service Bus';                Wildcard='*.servicebus.windows.net' }
-                    @{ Host='discoverysrv.windowsazure.com'; Port=443; Purpose='Azure Migrate Discovery service'; Wildcard='*.discoverysrv.windowsazure.com' }
-                    @{ Host='migration.windowsazure.com';    Port=443; Purpose='Azure Migrate Migration service'; Wildcard='*.migration.windowsazure.com' }
-                    @{ Host='hypervrecoverymanager.windowsazure.com'; Port=443; Purpose='Azure Site Recovery / Hyper-V Recovery Manager'; Wildcard='*.hypervrecoverymanager.windowsazure.com' }
-                    @{ Host='blob.core.windows.net';  Port=443; Purpose='Azure Blob Storage';               Wildcard='*.blob.core.windows.net' }
-                    @{ Host='aka.ms';                 Port=443; Purpose='Microsoft URL redirect service';    Wildcard='aka.ms' }
-                    @{ Host='download.microsoft.com'; Port=443; Purpose='Microsoft downloads';               Wildcard='download.microsoft.com' }
-                    @{ Host='prod.microsoftmetrics.com'; Port=443; Purpose='Azure Monitor metrics';          Wildcard='*.prod.microsoftmetrics.com' }
-                    @{ Host='prod.hot.ingestion.msftcloudes.com'; Port=443; Purpose='Telemetry ingestion';   Wildcard='*.prod.hot.ingestion.msftcloudes.com' }
-                )
-                foreach ($u in $assessmentUrls) {
-                    [void]$urls.Add(@{ Host=$u.Host; Port=$u.Port; Purpose=$u.Purpose; Wildcard=$u.Wildcard; Category='Assessment/Discovery' })
-                }
-            }
-
-            if ($ApplianceType -eq 'Replication' -or $Scenario -eq 'VMwareAgentless') {
-                if ($Scenario -eq 'VMwareAgentless') {
-                    # VMware agentless migration needs IoT Hub + gateway
-                    $agentlessMigUrls = @(
-                        @{ Host='azure-devices.net'; Port=443; Purpose='Azure IoT Hub (migration gateway)'; Wildcard='*.azure-devices.net' }
-                    )
-                    foreach ($u in $agentlessMigUrls) {
-                        [void]$urls.Add(@{ Host=$u.Host; Port=$u.Port; Purpose=$u.Purpose; Wildcard=$u.Wildcard; Category='VMware Agentless Migration' })
-                    }
-                }
-            }
-
-            if ($ApplianceType -eq 'Replication') {
-                if ($Scenario -eq 'AgentBasedLegacy') {
-                    # Agent-based legacy replication appliance
-                    $legacyReplUrls = @(
-                        @{ Host='hypervrecoverymanager.windowsazure.com'; Port=443; Purpose='Azure Recovery Services'; Wildcard='*.hypervrecoverymanager.windowsazure.com' }
-                        @{ Host='management.azure.com';   Port=443; Purpose='Azure Resource Manager'; Wildcard='management.azure.com' }
-                        @{ Host='login.microsoftonline.com'; Port=443; Purpose='Azure AD authentication'; Wildcard='login.microsoftonline.com' }
-                        @{ Host='blob.core.windows.net';  Port=443; Purpose='Azure Blob Storage (replication data)'; Wildcard='*.blob.core.windows.net' }
-                        @{ Host='backup.windowsazure.com'; Port=443; Purpose='Azure Backup service'; Wildcard='*.backup.windowsazure.com' }
-                        @{ Host='aka.ms';                 Port=443; Purpose='Microsoft URL redirect service'; Wildcard='aka.ms' }
-                        @{ Host='download.microsoft.com'; Port=443; Purpose='Microsoft downloads'; Wildcard='download.microsoft.com' }
-                        @{ Host='dc.services.visualstudio.com'; Port=443; Purpose='Application Insights telemetry'; Wildcard='*.services.visualstudio.com' }
-                        @{ Host='portal.azure.com';       Port=443; Purpose='Azure portal'; Wildcard='*.portal.azure.com' }
-                        @{ Host='login.windows.net';      Port=443; Purpose='Azure AD authentication (alt)'; Wildcard='login.windows.net' }
-                    )
-                    foreach ($u in $legacyReplUrls) {
-                        [void]$urls.Add(@{ Host=$u.Host; Port=$u.Port; Purpose=$u.Purpose; Wildcard=$u.Wildcard; Category='Agent-Based Legacy Replication' })
-                    }
-                }
-
-                if ($Scenario -eq 'AgentBasedModern') {
-                    # Agent-based modern replication appliance
-                    $modernReplUrls = @(
-                        @{ Host='hypervrecoverymanager.windowsazure.com'; Port=443; Purpose='Azure Recovery Services'; Wildcard='*.hypervrecoverymanager.windowsazure.com' }
-                        @{ Host='management.azure.com';   Port=443; Purpose='Azure Resource Manager'; Wildcard='management.azure.com' }
-                        @{ Host='login.microsoftonline.com'; Port=443; Purpose='Azure AD authentication'; Wildcard='login.microsoftonline.com' }
-                        @{ Host='blob.core.windows.net';  Port=443; Purpose='Azure Blob Storage (replication data)'; Wildcard='*.blob.core.windows.net' }
-                        @{ Host='backup.windowsazure.com'; Port=443; Purpose='Azure Backup service'; Wildcard='*.backup.windowsazure.com' }
-                        @{ Host='aka.ms';                 Port=443; Purpose='Microsoft URL redirect service'; Wildcard='aka.ms' }
-                        @{ Host='download.microsoft.com'; Port=443; Purpose='Microsoft downloads'; Wildcard='download.microsoft.com' }
-                        @{ Host='dc.services.visualstudio.com'; Port=443; Purpose='Application Insights telemetry'; Wildcard='*.services.visualstudio.com' }
-                        @{ Host='portal.azure.com';       Port=443; Purpose='Azure portal'; Wildcard='*.portal.azure.com' }
-                        @{ Host='login.windows.net';      Port=443; Purpose='Azure AD authentication (alt)'; Wildcard='login.windows.net' }
-                        @{ Host='azure-devices.net';      Port=443; Purpose='Azure IoT Hub (modern appliance)'; Wildcard='*.azure-devices.net' }
-                        @{ Host='prod.migration.windowsazure.com'; Port=443; Purpose='Modern migration service'; Wildcard='*.prod.migration.windowsazure.com' }
-                    )
-                    foreach ($u in $modernReplUrls) {
-                        [void]$urls.Add(@{ Host=$u.Host; Port=$u.Port; Purpose=$u.Purpose; Wildcard=$u.Wildcard; Category='Agent-Based Modern Replication' })
-                    }
-                }
+            # VMware Agentless / Replication-only endpoints
+            if ($Scenario -eq 'VMwareAgentless' -or $ApplianceType -eq 'Replication') {
+                $cat2 = 'VMware Agentless Migration'
+                local:Add-Url $urls 'hypervrecoverymanager.windowsazure.com' 443 '*.hypervrecoverymanager.windowsazure.com' 'Azure Site Recovery (agentless migration)' $cat2
+                local:Add-Url $urls 'blob.core.windows.net'                  443 '*.blob.core.windows.net'                  'Azure Blob Storage (migration data upload)' $cat2
             }
 
         } else {
-            # ==========================================
-            # PUBLIC CLOUD - PRIVATE LINK ENDPOINTS
-            # ==========================================
-            $privateLinkUrls = @(
-                @{ Host='portal.azure.com';       Port=443; Purpose='Azure portal';                     Wildcard='*.portal.azure.com' }
-                @{ Host='login.windows.net';      Port=443; Purpose='Azure AD authentication';          Wildcard='login.windows.net' }
-                @{ Host='login.microsoftonline.com'; Port=443; Purpose='Azure AD authentication';       Wildcard='*.microsoftonline.com' }
-                @{ Host='login.microsoftonline-p.com'; Port=443; Purpose='Azure AD authentication (passive)'; Wildcard='*.microsoftonline-p.com' }
-                @{ Host='management.azure.com';   Port=443; Purpose='Azure Resource Manager';           Wildcard='management.azure.com' }
-                @{ Host='dc.services.visualstudio.com'; Port=443; Purpose='Application Insights';       Wildcard='*.services.visualstudio.com' }
-                @{ Host='aka.ms';                 Port=443; Purpose='Microsoft URL redirect';            Wildcard='aka.ms' }
-                @{ Host='download.microsoft.com'; Port=443; Purpose='Microsoft downloads';               Wildcard='download.microsoft.com' }
-                @{ Host='vault.azure.net';        Port=443; Purpose='Azure Key Vault';                  Wildcard='*.vault.azure.net' }
-                @{ Host='servicebus.windows.net'; Port=443; Purpose='Azure Service Bus';                Wildcard='*.servicebus.windows.net' }
-                @{ Host='prod.migration.windowsazure.com'; Port=443; Purpose='Migration service (private link)'; Wildcard='*.prod.migration.windowsazure.com' }
-                @{ Host='privatelink.prod.migration.windowsazure.com'; Port=443; Purpose='Private Link migration/auto-update service'; Wildcard='*.privatelink.prod.migration.windowsazure.com' }
-                @{ Host='prod.microsoftmetrics.com'; Port=443; Purpose='Azure Monitor metrics';          Wildcard='*.prod.microsoftmetrics.com' }
-                @{ Host='prod.hot.ingestion.msftcloudes.com'; Port=443; Purpose='Telemetry ingestion';   Wildcard='*.prod.hot.ingestion.msftcloudes.com' }
-                @{ Host='blob.core.windows.net';  Port=443; Purpose='Azure Blob Storage';               Wildcard='*.blob.core.windows.net' }
-                @{ Host='privatelink.blob.core.windows.net'; Port=443; Purpose='Private Link Blob Storage'; Wildcard='*.privatelink.blob.core.windows.net' }
-                @{ Host='privatelink.vaultcore.azure.net'; Port=443; Purpose='Private Link Key Vault'; Wildcard='*.privatelink.vaultcore.azure.net' }
-                @{ Host='privatelink.servicebus.windows.net'; Port=443; Purpose='Private Link Service Bus'; Wildcard='*.privatelink.servicebus.windows.net' }
-            )
-            foreach ($u in $privateLinkUrls) {
-                [void]$urls.Add(@{ Host=$u.Host; Port=$u.Port; Purpose=$u.Purpose; Wildcard=$u.Wildcard; Category='Private Link (Public Cloud)' })
-            }
-
-            if ($Scenario -eq 'AgentBasedModern' -or $Scenario -eq 'VMwareAgentless') {
-                [void]$urls.Add(@{ Host='azure-devices.net'; Port=443; Purpose='Azure IoT Hub (modern/agentless)'; Wildcard='*.azure-devices.net'; Category='Private Link - Modern/Agentless' })
-            }
+            # ----------------------------------------------------------------
+            # Commercial — Private Link endpoints
+            # ----------------------------------------------------------------
+            $cat = 'Private Link - Core (Public Cloud)'
+            local:Add-Url $urls 'portal.azure.com'                    443 '*.portal.azure.com'                             'Azure portal'                                          $cat
+            local:Add-Url $urls 'login.windows.net'                   443 '*.windows.net'                                  'Microsoft Entra ID'                                    $cat
+            local:Add-Url $urls 'msftauth.net'                        443 '*.msftauth.net'                                  'Microsoft Entra ID'                                    $cat
+            local:Add-Url $urls 'msauth.net'                          443 '*.msauth.net'                                    'Microsoft Entra ID'                                    $cat
+            local:Add-Url $urls 'www.microsoft.com'                   443 '*.microsoft.com'                                 'Microsoft Entra ID'                                    $cat
+            local:Add-Url $urls 'login.live.com'                      443 '*.live.com'                                      'Microsoft Entra ID'                                    $cat
+            local:Add-Url $urls 'login.microsoftonline.com'           443 '*.microsoftonline.com'                           'Microsoft Entra ID'                                    $cat
+            local:Add-Url $urls 'login.microsoftonline-p.com'         443 '*.microsoftonline-p.com'                         'Microsoft Entra ID'                                    $cat
+            local:Add-Url $urls 'autologon.microsoftazuread-sso.com'  443 '*.microsoftazuread-sso.com'                      'Microsoft Entra ID SSO'                                $cat
+            local:Add-Url $urls 'management.azure.com'                443 'management.azure.com'                            'Azure Resource Manager'                                $cat
+            local:Add-Url $urls 'dc.services.visualstudio.com'        443 '*.services.visualstudio.com'                     'Appliance telemetry (optional)'                        $cat
+            local:Add-Url $urls 'aka.ms'                              443 'aka.ms/*'                                        'Appliance auto-update (optional)'                      $cat
+            local:Add-Url $urls 'download.microsoft.com'              443 'download.microsoft.com/download'                 'Microsoft downloads'                                   $cat
+            local:Add-Url $urls 'blob.core.windows.net'               443 '*.blob.core.windows.net'                         'Azure Blob Storage (optional if storage has private endpoint)' $cat
+            local:Add-Url $urls 'prod.migration.windowsazure.com'     443 '*.prod.migration.windowsazure.com'               'Migration service (private link)'                      $cat
+            local:Add-Url $urls 'prod.migration.windowsazure.com'     443 '*.privatelink.prod.migration.windowsazure.com'   'Private Link migration/auto-update zone'               $cat
+            local:Add-Url $urls 'blob.core.windows.net'               443 '*.privatelink.blob.core.windows.net'             'Private Link Blob Storage zone'                        $cat
+            local:Add-Url $urls 'vault.azure.net'                     443 '*.privatelink.vaultcore.azure.net'               'Private Link Key Vault zone'                           $cat
+            local:Add-Url $urls 'servicebus.windows.net'              443 '*.privatelink.servicebus.windows.net'            'Private Link Service Bus zone'                         $cat
         }
     }
 
-    # ----- GOVERNMENT CLOUD -----
-    if ($Cloud -eq 'Government') {
+    # ========================================================================
+    # GOVERNMENT CLOUD
+    # ========================================================================
+    elseif ($Cloud -eq 'Government') {
 
         if (-not $PrivateLink) {
-            # ==========================================
-            # GOVERNMENT CLOUD - PUBLIC ENDPOINTS
-            # ==========================================
+            # ----------------------------------------------------------------
+            # Government — Public endpoints
+            # ----------------------------------------------------------------
+            $cat = 'Core Services - Government Cloud'
+            local:Add-Url $urls 'portal.azure.us'                  443 '*.portal.azure.us'                   'Azure Government portal'                       $cat
+            local:Add-Url $urls 'graph.windows.net'                443 'graph.windows.net'                   'Sign in to subscription (Gov)'                 $cat
+            local:Add-Url $urls 'graph.microsoftazure.us'          443 'graph.microsoftazure.us'             'Sign in to subscription (Gov)'                 $cat
+            local:Add-Url $urls 'login.microsoftonline.us'         443 'login.microsoftonline.us'            'Microsoft Entra ID (Gov)'                      $cat
+            local:Add-Url $urls 'management.usgovcloudapi.net'     443 'management.usgovcloudapi.net'        'Azure Resource Manager (Gov)'                  $cat
+            local:Add-Url $urls 'dc.services.visualstudio.com'     443 '*.services.visualstudio.com'        'Appliance telemetry'                           $cat
+            local:Add-Url $urls 'vault.usgovcloudapi.net'          443 '*.vault.usgovcloudapi.net'           'Azure Key Vault (Gov)'                         $cat
+            local:Add-Url $urls 'aka.ms'                           443 'aka.ms/*'                            'Appliance auto-update downloads'               $cat
+            local:Add-Url $urls 'download.microsoft.com'           443 'download.microsoft.com/download'    'Microsoft downloads'                           $cat
+            local:Add-Url $urls 'servicebus.usgovcloudapi.net'     443 '*.servicebus.usgovcloudapi.net'      'Service Bus (Gov)'                             $cat
+            local:Add-Url $urls 'discoverysrv.windowsazure.us'     443 '*.discoverysrv.windowsazure.us'      'Discovery service (Gov)'                       $cat
+            local:Add-Url $urls 'migration.windowsazure.us'        443 '*.migration.windowsazure.us'         'Migration service (Gov)'                       $cat
+            local:Add-Url $urls 'dc.applicationinsights.us'        443 '*.applicationinsights.us'            'Application Insights (Gov)'                    $cat
 
-            if ($ApplianceType -eq 'Assessment' -or $Scenario -eq 'VMwareAgentless') {
-                $govAssessmentUrls = @(
-                    @{ Host='portal.azure.us';        Port=443; Purpose='Azure Government portal';          Wildcard='*.portal.azure.us' }
-                    @{ Host='login.microsoftonline.us'; Port=443; Purpose='Azure AD authentication (Gov)';  Wildcard='login.microsoftonline.us' }
-                    @{ Host='graph.windows.net';      Port=443; Purpose='Azure AD Graph';                   Wildcard='graph.windows.net' }
-                    @{ Host='management.usgovcloudapi.net'; Port=443; Purpose='Azure Resource Manager (Gov)'; Wildcard='management.usgovcloudapi.net' }
-                    @{ Host='dc.applicationinsights.us'; Port=443; Purpose='Application Insights (Gov)';    Wildcard='dc.applicationinsights.us' }
-                    @{ Host='vault.usgovcloudapi.net'; Port=443; Purpose='Azure Key Vault (Gov)';           Wildcard='*.vault.usgovcloudapi.net' }
-                    @{ Host='servicebus.usgovcloudapi.net'; Port=443; Purpose='Azure Service Bus (Gov)';    Wildcard='*.servicebus.usgovcloudapi.net' }
-                    @{ Host='discoverysrv.windowsazure.us'; Port=443; Purpose='Discovery service (Gov)';    Wildcard='*.discoverysrv.windowsazure.us' }
-                    @{ Host='migration.windowsazure.us'; Port=443; Purpose='Migration service (Gov)';       Wildcard='*.migration.windowsazure.us' }
-                    @{ Host='hypervrecoverymanager.windowsazure.us'; Port=443; Purpose='Recovery Manager (Gov)'; Wildcard='*.hypervrecoverymanager.windowsazure.us' }
-                    @{ Host='blob.core.usgovcloudapi.net'; Port=443; Purpose='Azure Blob Storage (Gov)';    Wildcard='*.blob.core.usgovcloudapi.net' }
-                    @{ Host='aka.ms';                 Port=443; Purpose='Microsoft URL redirect service';    Wildcard='aka.ms' }
-                    @{ Host='download.microsoft.com'; Port=443; Purpose='Microsoft downloads';               Wildcard='download.microsoft.com' }
-                    @{ Host='login.microsoftonline.com'; Port=443; Purpose='Azure AD (common endpoint)';     Wildcard='*.microsoftonline.com' }
-                    @{ Host='login.microsoftonline-p.com'; Port=443; Purpose='Azure AD passive auth';        Wildcard='*.microsoftonline-p.com' }
-                )
-                foreach ($u in $govAssessmentUrls) {
-                    [void]$urls.Add(@{ Host=$u.Host; Port=$u.Port; Purpose=$u.Purpose; Wildcard=$u.Wildcard; Category='Assessment/Discovery (Gov)' })
-                }
-            }
-
-            if ($ApplianceType -eq 'Replication' -or $Scenario -eq 'VMwareAgentless') {
-                if ($Scenario -eq 'VMwareAgentless') {
-                    [void]$urls.Add(@{ Host='azure-devices.net'; Port=443; Purpose='Azure IoT Hub - migration gateway (Gov)'; Wildcard='*.azure-devices.net'; Category='VMware Agentless Migration (Gov)' })
-                }
-            }
-
-            if ($ApplianceType -eq 'Replication') {
-                if ($Scenario -eq 'AgentBasedLegacy') {
-                    $govLegacyUrls = @(
-                        @{ Host='hypervrecoverymanager.windowsazure.us'; Port=443; Purpose='Recovery Services (Gov)'; Wildcard='*.hypervrecoverymanager.windowsazure.us' }
-                        @{ Host='management.usgovcloudapi.net';  Port=443; Purpose='ARM (Gov)'; Wildcard='management.usgovcloudapi.net' }
-                        @{ Host='login.microsoftonline.us';      Port=443; Purpose='Azure AD (Gov)'; Wildcard='login.microsoftonline.us' }
-                        @{ Host='blob.core.usgovcloudapi.net';   Port=443; Purpose='Blob Storage (Gov)'; Wildcard='*.blob.core.usgovcloudapi.net' }
-                        @{ Host='backup.windowsazure.us';        Port=443; Purpose='Backup service (Gov)'; Wildcard='*.backup.windowsazure.us' }
-                        @{ Host='aka.ms';                        Port=443; Purpose='URL redirect'; Wildcard='aka.ms' }
-                        @{ Host='download.microsoft.com';        Port=443; Purpose='Downloads'; Wildcard='download.microsoft.com' }
-                        @{ Host='dc.applicationinsights.us';     Port=443; Purpose='App Insights (Gov)'; Wildcard='dc.applicationinsights.us' }
-                        @{ Host='portal.azure.us';               Port=443; Purpose='Azure Gov portal'; Wildcard='*.portal.azure.us' }
-                    )
-                    foreach ($u in $govLegacyUrls) {
-                        [void]$urls.Add(@{ Host=$u.Host; Port=$u.Port; Purpose=$u.Purpose; Wildcard=$u.Wildcard; Category='Agent-Based Legacy Replication (Gov)' })
-                    }
-                }
-                if ($Scenario -eq 'AgentBasedModern') {
-                    $govModernUrls = @(
-                        @{ Host='hypervrecoverymanager.windowsazure.us'; Port=443; Purpose='Recovery Services (Gov)'; Wildcard='*.hypervrecoverymanager.windowsazure.us' }
-                        @{ Host='management.usgovcloudapi.net';  Port=443; Purpose='ARM (Gov)'; Wildcard='management.usgovcloudapi.net' }
-                        @{ Host='login.microsoftonline.us';      Port=443; Purpose='Azure AD (Gov)'; Wildcard='login.microsoftonline.us' }
-                        @{ Host='blob.core.usgovcloudapi.net';   Port=443; Purpose='Blob Storage (Gov)'; Wildcard='*.blob.core.usgovcloudapi.net' }
-                        @{ Host='backup.windowsazure.us';        Port=443; Purpose='Backup service (Gov)'; Wildcard='*.backup.windowsazure.us' }
-                        @{ Host='aka.ms';                        Port=443; Purpose='URL redirect'; Wildcard='aka.ms' }
-                        @{ Host='download.microsoft.com';        Port=443; Purpose='Downloads'; Wildcard='download.microsoft.com' }
-                        @{ Host='dc.applicationinsights.us';     Port=443; Purpose='App Insights (Gov)'; Wildcard='dc.applicationinsights.us' }
-                        @{ Host='portal.azure.us';               Port=443; Purpose='Azure Gov portal'; Wildcard='*.portal.azure.us' }
-                        @{ Host='azure-devices.net';             Port=443; Purpose='IoT Hub (modern)'; Wildcard='*.azure-devices.net' }
-                        @{ Host='prod.migration.windowsazure.us'; Port=443; Purpose='Modern migration service (Gov)'; Wildcard='*.prod.migration.windowsazure.us' }
-                    )
-                    foreach ($u in $govModernUrls) {
-                        [void]$urls.Add(@{ Host=$u.Host; Port=$u.Port; Purpose=$u.Purpose; Wildcard=$u.Wildcard; Category='Agent-Based Modern Replication (Gov)' })
-                    }
-                }
+            if ($Scenario -eq 'VMwareAgentless' -or $ApplianceType -eq 'Replication') {
+                $cat2 = 'VMware Agentless Migration (Gov)'
+                local:Add-Url $urls 'hypervrecoverymanager.windowsazure.us' 443 '*.hypervrecoverymanager.windowsazure.us' 'ASR (Gov agentless migration)'  $cat2
+                local:Add-Url $urls 'blob.core.usgovcloudapi.net'           443 '*.blob.core.usgovcloudapi.net'           'Azure Blob Storage (Gov)'        $cat2
             }
 
         } else {
-            # ==========================================
-            # GOVERNMENT CLOUD - PRIVATE LINK ENDPOINTS
-            # ==========================================
-            $govPrivateLinkUrls = @(
-                @{ Host='portal.azure.us';        Port=443; Purpose='Azure Government portal';          Wildcard='*.portal.azure.us' }
-                @{ Host='login.microsoftonline.us'; Port=443; Purpose='Azure AD (Gov)';                 Wildcard='login.microsoftonline.us' }
-                @{ Host='graph.windows.net';      Port=443; Purpose='Azure AD Graph';                   Wildcard='graph.windows.net' }
-                @{ Host='management.usgovcloudapi.net'; Port=443; Purpose='ARM (Gov)';                  Wildcard='management.usgovcloudapi.net' }
-                @{ Host='dc.applicationinsights.us'; Port=443; Purpose='App Insights (Gov)';            Wildcard='dc.applicationinsights.us' }
-                @{ Host='vault.usgovcloudapi.net'; Port=443; Purpose='Key Vault (Gov)';                 Wildcard='*.vault.usgovcloudapi.net' }
-                @{ Host='servicebus.usgovcloudapi.net'; Port=443; Purpose='Service Bus (Gov)';          Wildcard='*.servicebus.usgovcloudapi.net' }
-                @{ Host='prod.migration.windowsazure.us'; Port=443; Purpose='Migration (Gov PL)';       Wildcard='*.prod.migration.windowsazure.us' }
-                @{ Host='privatelink.prod.migration.windowsazure.us'; Port=443; Purpose='Private Link migration/auto-update service (Gov)'; Wildcard='*.privatelink.prod.migration.windowsazure.us' }
-                @{ Host='blob.core.usgovcloudapi.net'; Port=443; Purpose='Blob Storage (Gov)';          Wildcard='*.blob.core.usgovcloudapi.net' }
-                @{ Host='privatelink.blob.core.usgovcloudapi.net'; Port=443; Purpose='Private Link Blob Storage (Gov)'; Wildcard='*.privatelink.blob.core.usgovcloudapi.net' }
-                @{ Host='aka.ms';                 Port=443; Purpose='URL redirect';                      Wildcard='aka.ms' }
-                @{ Host='download.microsoft.com'; Port=443; Purpose='Downloads';                         Wildcard='download.microsoft.com' }
-                @{ Host='login.microsoftonline.com'; Port=443; Purpose='Azure AD (common)';              Wildcard='*.microsoftonline.com' }
-                @{ Host='login.microsoftonline-p.com'; Port=443; Purpose='Azure AD passive';             Wildcard='*.microsoftonline-p.com' }
-            )
-            foreach ($u in $govPrivateLinkUrls) {
-                [void]$urls.Add(@{ Host=$u.Host; Port=$u.Port; Purpose=$u.Purpose; Wildcard=$u.Wildcard; Category='Private Link (Gov Cloud)' })
-            }
-
-            if ($Scenario -eq 'AgentBasedModern' -or $Scenario -eq 'VMwareAgentless') {
-                [void]$urls.Add(@{ Host='azure-devices.net'; Port=443; Purpose='IoT Hub (modern/agentless)'; Wildcard='*.azure-devices.net'; Category='Private Link - Modern/Agentless (Gov)' })
-            }
+            # ----------------------------------------------------------------
+            # Government — Private Link endpoints
+            # ----------------------------------------------------------------
+            $cat = 'Private Link - Core (Gov Cloud)'
+            local:Add-Url $urls 'portal.azure.us'                          443 '*.portal.azure.us'                              'Azure Government portal'                    $cat
+            local:Add-Url $urls 'graph.windows.net'                        443 'graph.windows.net'                              'Sign in to subscription'                    $cat
+            local:Add-Url $urls 'login.microsoftonline.us'                 443 'login.microsoftonline.us'                       'Microsoft Entra ID (Gov)'                   $cat
+            local:Add-Url $urls 'management.usgovcloudapi.net'             443 'management.usgovcloudapi.net'                   'ARM (Gov)'                                  $cat
+            local:Add-Url $urls 'dc.services.visualstudio.com'             443 '*.services.visualstudio.com'                   'Telemetry (optional)'                       $cat
+            local:Add-Url $urls 'aka.ms'                                   443 'aka.ms/*'                                       'Auto-update (optional)'                     $cat
+            local:Add-Url $urls 'download.microsoft.com'                   443 'download.microsoft.com/download'               'Downloads'                                  $cat
+            local:Add-Url $urls 'blob.core.usgovcloudapi.net'              443 '*.blob.core.usgovcloudapi.net'                  'Blob (optional)'                            $cat
+            local:Add-Url $urls 'dc.applicationinsights.us'                443 '*.applicationinsights.us'                      'App Insights (optional)'                    $cat
+            local:Add-Url $urls 'prod.migration.windowsazure.us'           443 '*.prod.migration.windowsazure.us'               'Migration (Gov PL)'                         $cat
+            local:Add-Url $urls 'prod.migration.windowsazure.us'           443 '*.privatelink.prod.migration.windowsazure.us'   'Private Link migration zone (Gov)'          $cat
+            local:Add-Url $urls 'blob.core.usgovcloudapi.net'              443 '*.privatelink.blob.core.usgovcloudapi.net'      'Private Link Blob zone (Gov)'               $cat
         }
     }
 
-    # Deduplicate by Host+Port (keep first occurrence)
+    # ========================================================================
+    # CHINA (21Vianet) CLOUD
+    # ========================================================================
+    elseif ($Cloud -eq 'China') {
+
+        if (-not $PrivateLink) {
+            # ----------------------------------------------------------------
+            # China — Public endpoints
+            # ----------------------------------------------------------------
+            $cat = 'Core Services - China (21Vianet)'
+            local:Add-Url $urls 'portal.azure.cn'                         443 '*.portal.azure.cn'                          'Azure China portal'                            $cat
+            local:Add-Url $urls 'graph.chinacloudapi.cn'                  443 'graph.chinacloudapi.cn'                     'Sign in to subscription (China)'               $cat
+            local:Add-Url $urls 'login.microsoftonline.cn'                443 'login.microsoftonline.cn'                   'Microsoft Entra ID (China)'                    $cat
+            local:Add-Url $urls 'management.chinacloudapi.cn'             443 'management.chinacloudapi.cn'                'Azure Resource Manager (China)'                $cat
+            local:Add-Url $urls 'dc.services.visualstudio.com'            443 '*.services.visualstudio.com'               'Appliance telemetry'                           $cat
+            local:Add-Url $urls 'vault.chinacloudapi.cn'                  443 '*.vault.chinacloudapi.cn'                   'Azure Key Vault (China)'                       $cat
+            local:Add-Url $urls 'aka.ms'                                  443 'aka.ms/*'                                   'Appliance auto-update'                         $cat
+            local:Add-Url $urls 'download.microsoft.com'                  443 'download.microsoft.com/download'           'Microsoft downloads'                           $cat
+            local:Add-Url $urls 'servicebus.chinacloudapi.cn'             443 '*.servicebus.chinacloudapi.cn'              'Service Bus (China)'                           $cat
+            local:Add-Url $urls 'discoverysrv.cn2.windowsazure.cn'        443 '*.discoverysrv.cn2.windowsazure.cn'         'Discovery service (China)'                     $cat
+            local:Add-Url $urls 'cn2.prod.migration.windowsazure.cn'      443 '*.cn2.prod.migration.windowsazure.cn'       'Migration service (China)'                     $cat
+            local:Add-Url $urls 'dc.applicationinsights.azure.cn'         443 '*.applicationinsights.azure.cn'            'App Insights (China)'                          $cat
+
+            if ($Scenario -eq 'VMwareAgentless' -or $ApplianceType -eq 'Replication') {
+                $cat2 = 'VMware Agentless Migration (China)'
+                local:Add-Url $urls 'cn2.hypervrecoverymanager.windowsazure.cn' 443 '*.cn2.hypervrecoverymanager.windowsazure.cn' 'ASR (China agentless migration)' $cat2
+                local:Add-Url $urls 'blob.core.chinacloudapi.cn'                443 '*.blob.core.chinacloudapi.cn'                'Azure Blob Storage (China)'       $cat2
+            }
+        } else {
+            # China Private Link — no official separate list; use same as public with a note
+            Write-Host "  [INFO] China (21Vianet) Private Link endpoint list not yet published." -ForegroundColor Yellow
+            Write-Host "         Testing public China endpoints. Consult your Microsoft account team." -ForegroundColor Yellow
+            $cat = 'Core Services - China (21Vianet) [Private Link TBD]'
+            local:Add-Url $urls 'portal.azure.cn'                         443 '*.portal.azure.cn'                          'Azure China portal'                            $cat
+            local:Add-Url $urls 'graph.chinacloudapi.cn'                  443 'graph.chinacloudapi.cn'                     'Sign in to subscription (China)'               $cat
+            local:Add-Url $urls 'login.microsoftonline.cn'                443 'login.microsoftonline.cn'                   'Microsoft Entra ID (China)'                    $cat
+            local:Add-Url $urls 'management.chinacloudapi.cn'             443 'management.chinacloudapi.cn'                'Azure Resource Manager (China)'                $cat
+            local:Add-Url $urls 'dc.services.visualstudio.com'            443 '*.services.visualstudio.com'               'Appliance telemetry'                           $cat
+            local:Add-Url $urls 'vault.chinacloudapi.cn'                  443 '*.vault.chinacloudapi.cn'                   'Azure Key Vault (China)'                       $cat
+            local:Add-Url $urls 'aka.ms'                                  443 'aka.ms/*'                                   'Appliance auto-update'                         $cat
+            local:Add-Url $urls 'download.microsoft.com'                  443 'download.microsoft.com/download'           'Microsoft downloads'                           $cat
+            local:Add-Url $urls 'servicebus.chinacloudapi.cn'             443 '*.servicebus.chinacloudapi.cn'              'Service Bus (China)'                           $cat
+            local:Add-Url $urls 'discoverysrv.cn2.windowsazure.cn'        443 '*.discoverysrv.cn2.windowsazure.cn'         'Discovery service (China)'                     $cat
+            local:Add-Url $urls 'cn2.prod.migration.windowsazure.cn'      443 '*.cn2.prod.migration.windowsazure.cn'       'Migration service (China)'                     $cat
+            local:Add-Url $urls 'dc.applicationinsights.azure.cn'         443 '*.applicationinsights.azure.cn'            'App Insights (China)'                          $cat
+        }
+    }
+
+    # Deduplicate by Host+Port+Wildcard (keep first occurrence)
     $seen = @{}
     $dedupedUrls = [System.Collections.ArrayList]::new()
     foreach ($u in $urls) {
-        $key = "$($u.Host):$($u.Port)"
+        $key = "$($u.Host):$($u.Port):$($u.Wildcard)"
         if (-not $seen.ContainsKey($key)) {
             $seen[$key] = $true
             [void]$dedupedUrls.Add($u)
@@ -574,8 +521,8 @@ function Get-EnvironmentInfo {
         $adapters = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' }
         foreach ($a in $adapters) {
             $ipConfig = Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
-            $gateway = Get-NetRoute -InterfaceIndex $a.ifIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object -First 1
-            $dns = Get-DnsClientServerAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+            $gateway  = Get-NetRoute -InterfaceIndex $a.ifIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object -First 1
+            $dns      = Get-DnsClientServerAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
             Write-Host "    Adapter:  $($a.Name) [$($a.InterfaceDescription)]" -ForegroundColor Gray
             Write-Host "    IP:       $(($ipConfig.IPAddress | Select-Object -First 1))" -ForegroundColor Gray
             if ($gateway) {
@@ -613,9 +560,9 @@ function Get-ProxyConfiguration {
     # 2. System (IE) proxy settings
     Write-SubSection "Internet Explorer / System Proxy Settings"
     try {
-        $regPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
-        $proxyEnable = (Get-ItemProperty -Path $regPath -Name 'ProxyEnable' -ErrorAction SilentlyContinue).ProxyEnable
-        $proxyServer = (Get-ItemProperty -Path $regPath -Name 'ProxyServer' -ErrorAction SilentlyContinue).ProxyServer
+        $regPath       = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+        $proxyEnable   = (Get-ItemProperty -Path $regPath -Name 'ProxyEnable'   -ErrorAction SilentlyContinue).ProxyEnable
+        $proxyServer   = (Get-ItemProperty -Path $regPath -Name 'ProxyServer'   -ErrorAction SilentlyContinue).ProxyServer
         $proxyOverride = (Get-ItemProperty -Path $regPath -Name 'ProxyOverride' -ErrorAction SilentlyContinue).ProxyOverride
         $autoConfigUrl = (Get-ItemProperty -Path $regPath -Name 'AutoConfigURL' -ErrorAction SilentlyContinue).AutoConfigURL
 
@@ -657,7 +604,7 @@ function Get-ProxyConfiguration {
     try {
         $defaultProxy = [System.Net.WebRequest]::DefaultWebProxy
         if ($defaultProxy) {
-            $testUri = [System.Uri]"https://management.azure.com"
+            $testUri  = [System.Uri]"https://management.azure.com"
             $proxyUri = $defaultProxy.GetProxy($testUri)
             if ($proxyUri -and $proxyUri.AbsoluteUri -ne $testUri.AbsoluteUri) {
                 Write-Host "    .NET proxy for management.azure.com: $($proxyUri.AbsoluteUri)" -ForegroundColor Gray
@@ -736,7 +683,7 @@ function Test-BasicConnectivity {
     $dnsTest = Test-DnsResolution -HostName 'www.microsoft.com'
     $tcpTest = Test-TcpPort -HostName 'www.microsoft.com' -Port 443
     if ($dnsTest.Success -and $tcpTest.Success) {
-        Write-Host "    [PASS] DNS and TCP/443 to www.microsoft.com succeeded (${($tcpTest.LatencyMs)}ms)" -ForegroundColor Green
+        Write-Host "    [PASS] DNS and TCP/443 to www.microsoft.com succeeded ($($tcpTest.LatencyMs)ms)" -ForegroundColor Green
     } elseif (-not $dnsTest.Success) {
         Write-Host "    [FAIL] Cannot resolve www.microsoft.com - DNS resolution failed" -ForegroundColor Red
         Write-Host "           Error: $($dnsTest.Error)" -ForegroundColor Red
@@ -751,7 +698,7 @@ function Test-BasicConnectivity {
     Write-SubSection "TLS 1.2 Handshake Test"
     $httpsResult = Test-HttpsConnectivity -Url 'www.microsoft.com'
     if ($httpsResult.Success) {
-        Write-Host "    [PASS] HTTPS/TLS handshake to www.microsoft.com succeeded (HTTP $($httpsResult.StatusCode), ${($httpsResult.LatencyMs)}ms)" -ForegroundColor Green
+        Write-Host "    [PASS] HTTPS/TLS handshake to www.microsoft.com succeeded (HTTP $($httpsResult.StatusCode), $($httpsResult.LatencyMs)ms)" -ForegroundColor Green
         if ($httpsResult.CertIssuer) {
             Write-Host "    Certificate Issuer: $($httpsResult.CertIssuer)" -ForegroundColor Gray
             # Check for SSL inspection
@@ -769,6 +716,163 @@ See: https://learn.microsoft.com/en-us/azure/migrate/troubleshoot-appliance#conn
     } else {
         Write-Host "    [FAIL] HTTPS to www.microsoft.com failed: $($httpsResult.Error)" -ForegroundColor Red
         [void]$script:Recommendations.Add("HTTPS/TLS connections are failing. This blocks all Azure Migrate communication. Check firewall, proxy, and TLS settings.")
+    }
+}
+
+# ============================================================================
+# PLATFORM SOURCE CONNECTIVITY CHECKS  (NEW in v2.0)
+# ============================================================================
+
+function Test-PlatformPorts {
+    param(
+        [ValidateSet('VMware','HyperV','Physical')]
+        [string]$Platform
+    )
+
+    Write-Section "PLATFORM SOURCE CONNECTIVITY CHECKS"
+
+    Write-Host "  These checks verify that the appliance can reach the SOURCE infrastructure" -ForegroundColor Gray
+    Write-Host "  (vCenter, Hyper-V hosts, physical servers) it needs to discover/migrate." -ForegroundColor Gray
+    Write-Host "  All prompts can be left blank to skip the individual test." -ForegroundColor Gray
+
+    switch ($Platform) {
+
+        'VMware' {
+            # ---- vCenter ----
+            Write-SubSection "VMware vCenter Server"
+            $vcHost = (Read-Host "  Enter vCenter FQDN or IP (blank to skip)").Trim()
+            if ($vcHost) {
+                Write-Host "    Testing TCP/443 to vCenter ($vcHost) ..." -NoNewline -ForegroundColor White
+                $r = Test-TcpPort -HostName $vcHost -Port 443
+                if ($r.Success) {
+                    Write-Host " PASS ($($r.LatencyMs)ms)" -ForegroundColor Green
+                } else {
+                    Write-Host " FAIL - $($r.Error)" -ForegroundColor Red
+                    [void]$script:Recommendations.Add("PLATFORM: TCP/443 to vCenter ($vcHost) is BLOCKED. The appliance needs TCP/443 to vCenter for discovery. Check firewall rules between the appliance network and the vCenter network.")
+                }
+            } else {
+                Write-Host "    (vCenter test skipped)" -ForegroundColor DarkGray
+            }
+
+            # ---- ESXi hosts ----
+            Write-SubSection "VMware ESXi Host(s)"
+            Write-Host "  You can enter one or more ESXi host FQDNs/IPs. Press Enter with a blank line to stop." -ForegroundColor Gray
+            $esxiHosts = @()
+            do {
+                $esxiEntry = (Read-Host "  ESXi host FQDN/IP (blank to finish)").Trim()
+                if ($esxiEntry) { $esxiHosts += $esxiEntry }
+            } while ($esxiEntry)
+
+            foreach ($esxi in $esxiHosts) {
+                # TCP/443 — management API
+                Write-Host "    [$esxi] TCP/443  ... " -NoNewline -ForegroundColor White
+                $r443 = Test-TcpPort -HostName $esxi -Port 443
+                if ($r443.Success) {
+                    Write-Host "PASS ($($r443.LatencyMs)ms)" -ForegroundColor Green
+                } else {
+                    Write-Host "FAIL - $($r443.Error)" -ForegroundColor Red
+                    [void]$script:Recommendations.Add("PLATFORM: TCP/443 to ESXi host ($esxi) is BLOCKED. Required for agentless disk snapshot data transfer.")
+                }
+
+                # TCP/902 — NFC data transfer (agentless migration)
+                Write-Host "    [$esxi] TCP/902  ... " -NoNewline -ForegroundColor White
+                $r902 = Test-TcpPort -HostName $esxi -Port 902
+                if ($r902.Success) {
+                    Write-Host "PASS ($($r902.LatencyMs)ms)" -ForegroundColor Green
+                } else {
+                    Write-Host "FAIL - $($r902.Error)" -ForegroundColor Red
+                    [void]$script:Recommendations.Add("PLATFORM: TCP/902 to ESXi host ($esxi) is BLOCKED. Port 902 (NFC) is required for agentless VM disk replication. Ensure this port is open between the appliance and ESXi hosts.")
+                }
+            }
+            if ($esxiHosts.Count -eq 0) {
+                Write-Host "    (ESXi host tests skipped)" -ForegroundColor DarkGray
+            }
+        }
+
+        'HyperV' {
+            Write-SubSection "Hyper-V Host(s)"
+            Write-Host "  Enter one or more Hyper-V host FQDNs/IPs. Press Enter with a blank line to stop." -ForegroundColor Gray
+            $hvHosts = @()
+            do {
+                $hvEntry = (Read-Host "  Hyper-V host FQDN/IP (blank to finish)").Trim()
+                if ($hvEntry) { $hvHosts += $hvEntry }
+            } while ($hvEntry)
+
+            foreach ($hv in $hvHosts) {
+                # TCP/5985 — WinRM HTTP
+                Write-Host "    [$hv] TCP/5985 (WinRM HTTP)  ... " -NoNewline -ForegroundColor White
+                $r5985 = Test-TcpPort -HostName $hv -Port 5985
+                if ($r5985.Success) {
+                    Write-Host "PASS ($($r5985.LatencyMs)ms)" -ForegroundColor Green
+                } else {
+                    Write-Host "FAIL - $($r5985.Error)" -ForegroundColor Red
+                    [void]$script:Recommendations.Add("PLATFORM: TCP/5985 (WinRM HTTP) to Hyper-V host ($hv) is BLOCKED. The appliance needs WinRM access to Hyper-V hosts for discovery and migration.")
+                }
+
+                # TCP/5986 — WinRM HTTPS
+                Write-Host "    [$hv] TCP/5986 (WinRM HTTPS) ... " -NoNewline -ForegroundColor White
+                $r5986 = Test-TcpPort -HostName $hv -Port 5986
+                if ($r5986.Success) {
+                    Write-Host "PASS ($($r5986.LatencyMs)ms)" -ForegroundColor Green
+                } else {
+                    Write-Host "FAIL - $($r5986.Error)" -ForegroundColor Red
+                    [void]$script:Recommendations.Add("PLATFORM: TCP/5986 (WinRM HTTPS) to Hyper-V host ($hv) is BLOCKED. Ensure WinRM over HTTPS is allowed from the appliance to the Hyper-V hosts.")
+                }
+            }
+            if ($hvHosts.Count -eq 0) {
+                Write-Host "    (Hyper-V host tests skipped)" -ForegroundColor DarkGray
+            }
+        }
+
+        'Physical' {
+            Write-SubSection "Physical / Other Cloud Server(s)"
+            Write-Host "  Enter one or more target server FQDNs/IPs for Windows (WinRM) or Linux (SSH) checks." -ForegroundColor Gray
+            Write-Host "  Press Enter with a blank line to stop." -ForegroundColor Gray
+
+            $physHosts = @()
+            do {
+                $physEntry = (Read-Host "  Server FQDN/IP (blank to finish)").Trim()
+                if ($physEntry) {
+                    $osType = Get-MenuSelection -Prompt "Is '$physEntry' a Windows or Linux server?" `
+                        -Options @('Windows (WinRM TCP/5985 and TCP/5986)', 'Linux (SSH TCP/22)')
+                    $physHosts += [PSCustomObject]@{ Host=$physEntry; OS=if($osType -eq 1){'Windows'}else{'Linux'} }
+                }
+            } while ($physEntry)
+
+            foreach ($ph in $physHosts) {
+                if ($ph.OS -eq 'Windows') {
+                    Write-Host "    [$($ph.Host)] TCP/5985 (WinRM HTTP)  ... " -NoNewline -ForegroundColor White
+                    $r5985 = Test-TcpPort -HostName $ph.Host -Port 5985
+                    if ($r5985.Success) {
+                        Write-Host "PASS ($($r5985.LatencyMs)ms)" -ForegroundColor Green
+                    } else {
+                        Write-Host "FAIL - $($r5985.Error)" -ForegroundColor Red
+                        [void]$script:Recommendations.Add("PLATFORM: TCP/5985 (WinRM HTTP) to Windows server ($($ph.Host)) is BLOCKED. Required for agentless discovery of Windows physical/cloud servers.")
+                    }
+
+                    Write-Host "    [$($ph.Host)] TCP/5986 (WinRM HTTPS) ... " -NoNewline -ForegroundColor White
+                    $r5986 = Test-TcpPort -HostName $ph.Host -Port 5986
+                    if ($r5986.Success) {
+                        Write-Host "PASS ($($r5986.LatencyMs)ms)" -ForegroundColor Green
+                    } else {
+                        Write-Host "FAIL - $($r5986.Error)" -ForegroundColor Red
+                        [void]$script:Recommendations.Add("PLATFORM: TCP/5986 (WinRM HTTPS) to Windows server ($($ph.Host)) is BLOCKED.")
+                    }
+                } else {
+                    Write-Host "    [$($ph.Host)] TCP/22  (SSH)          ... " -NoNewline -ForegroundColor White
+                    $r22 = Test-TcpPort -HostName $ph.Host -Port 22
+                    if ($r22.Success) {
+                        Write-Host "PASS ($($r22.LatencyMs)ms)" -ForegroundColor Green
+                    } else {
+                        Write-Host "FAIL - $($r22.Error)" -ForegroundColor Red
+                        [void]$script:Recommendations.Add("PLATFORM: TCP/22 (SSH) to Linux server ($($ph.Host)) is BLOCKED. Required for agentless discovery of Linux physical/cloud servers.")
+                    }
+                }
+            }
+            if ($physHosts.Count -eq 0) {
+                Write-Host "    (Physical/cloud server tests skipped)" -ForegroundColor DarkGray
+            }
+        }
     }
 }
 
@@ -815,7 +919,7 @@ function Invoke-ConnectivityTests {
     Write-Host ""
 
     $currentCategory = ''
-    $totalCount = $UrlList.Count
+    $totalCount  = $UrlList.Count
     $currentIndex = 0
 
     foreach ($entry in $UrlList) {
@@ -828,7 +932,6 @@ function Invoke-ConnectivityTests {
 
         $host_ = $entry.Host
         $port  = $entry.Port
-        $pct   = [math]::Round(($currentIndex / $totalCount) * 100)
 
         Write-Host "    [$currentIndex/$totalCount] Testing $($host_):$port ... " -NoNewline -ForegroundColor White
 
@@ -884,6 +987,86 @@ function Invoke-ConnectivityTests {
 }
 
 # ============================================================================
+# AUTO-UPDATE GUID URL HELPER  (NEW in v2.0)
+# ============================================================================
+
+function Get-AutoUpdateGuidUrl {
+    param(
+        [System.Collections.ArrayList]$CustomUrls
+    )
+
+    Write-Host ""
+    Write-Host "  Do you have an auto-update GUID URL from an appliance error message?" -ForegroundColor White
+    Write-Host "  (e.g. https://<guid>-agent.uga.disc.privatelink.prod.migration.windowsazure.com/...)" -ForegroundColor Gray
+    $yn = Read-Host "  Enter Y to add it, or press Enter to skip"
+    if ($yn -match '^[Yy]') {
+        $guidUrl = (Read-Host "  Paste the full auto-update URL").Trim()
+        if ($guidUrl) {
+            $hostPart = $guidUrl -replace '^https?://', '' -replace '/.*$', ''
+            if ($hostPart) {
+                [void]$CustomUrls.Add(@{
+                    Host     = $hostPart
+                    Port     = 443
+                    Purpose  = 'Auto-update GUID endpoint (from appliance error)'
+                    Wildcard = "*.$($hostPart -replace '^[^.]+\.', '')"
+                    Category = 'Auto-Update Endpoint (GUID)'
+                })
+                Write-Host "    Added: $hostPart" -ForegroundColor Green
+                Write-Host ""
+                Write-Host "  GUIDANCE: This GUID URL is unique to your Azure Migrate project." -ForegroundColor Yellow
+                Write-Host "  For PRIVATE LINK deployments, the private DNS zone must have an A record" -ForegroundColor Yellow
+                Write-Host "  for this FQDN pointing to the private endpoint IP. Without it, auto-update" -ForegroundColor Yellow
+                Write-Host "  will fail with 'service endpoint unreachable'." -ForegroundColor Yellow
+                Write-Host "  See: https://learn.microsoft.com/en-us/azure/migrate/troubleshoot-appliance" -ForegroundColor Cyan
+            }
+        }
+    }
+}
+
+# ============================================================================
+# FIREWALL RULE SUMMARY  (NEW in v2.0)
+# ============================================================================
+
+function Write-FirewallRuleSummary {
+    Write-Section "FIREWALL RULE SUMMARY (for network teams)"
+
+    $failed = $script:TestResults | Where-Object { -not $_.OverallPass }
+    $passed = $script:TestResults | Where-Object { $_.OverallPass }
+
+    Write-Host ""
+    if ($failed.Count -gt 0) {
+        Write-Host "  [ACTION REQUIRED] BLOCKED - add these outbound TCP/443 firewall rules:" -ForegroundColor Red
+        Write-Host ""
+        # Deduplicate by wildcard pattern
+        $seenWild = @{}
+        foreach ($f in $failed) {
+            if (-not $seenWild.ContainsKey($f.WildcardPattern)) {
+                $seenWild[$f.WildcardPattern] = $true
+                $proto = "TCP/$($f.Port)"
+                Write-Host ("    Allow outbound {0,-8} to  {1,-60}  # {2}" -f $proto, $f.WildcardPattern, $f.Purpose) -ForegroundColor Red
+            }
+        }
+        Write-Host ""
+    } else {
+        Write-Host "  [ACTION REQUIRED]: None — no blocked endpoints detected." -ForegroundColor Green
+    }
+
+    if ($passed.Count -gt 0) {
+        Write-Host "  [OK] PASSING - no action needed:" -ForegroundColor Green
+        Write-Host ""
+        $seenWild2 = @{}
+        foreach ($p in $passed) {
+            if (-not $seenWild2.ContainsKey($p.WildcardPattern)) {
+                $seenWild2[$p.WildcardPattern] = $true
+                $proto = "TCP/$($p.Port)"
+                Write-Host ("    OK  outbound {0,-8} to  {1,-60}  # {2}" -f $proto, $p.WildcardPattern, $p.Purpose) -ForegroundColor Green
+            }
+        }
+        Write-Host ""
+    }
+}
+
+# ============================================================================
 # RESULTS REPORTING
 # ============================================================================
 
@@ -892,11 +1075,13 @@ function Write-ResultsSummary {
         [string]$Cloud,
         [string]$Scenario,
         [string]$ApplianceType,
+        [string]$Platform,
+        [string]$ConnectivityPath,
         [bool]$PrivateLink
     )
 
-    $failed = $script:TestResults | Where-Object { -not $_.OverallPass }
-    $passed = $script:TestResults | Where-Object { $_.OverallPass }
+    $failed    = $script:TestResults | Where-Object { -not $_.OverallPass }
+    $passed    = $script:TestResults | Where-Object { $_.OverallPass }
     $dnsFails  = $script:TestResults | Where-Object { -not $_.DnsPass }
     $tcpFails  = $script:TestResults | Where-Object { $_.DnsPass -and -not $_.TcpPass }
     $httpFails = $script:TestResults | Where-Object { $_.DnsPass -and $_.TcpPass -and -not $_.HttpsPass }
@@ -904,10 +1089,12 @@ function Write-ResultsSummary {
     Write-Section "RESULTS SUMMARY"
     Write-Host ""
     Write-Host "  Configuration Tested:" -ForegroundColor White
-    Write-Host "    Cloud:          $Cloud" -ForegroundColor Gray
-    Write-Host "    Scenario:       $Scenario" -ForegroundColor Gray
-    Write-Host "    Appliance Type: $ApplianceType" -ForegroundColor Gray
-    Write-Host "    Private Link:   $PrivateLink" -ForegroundColor Gray
+    Write-Host "    Cloud:             $Cloud"            -ForegroundColor Gray
+    Write-Host "    Scenario:          $Scenario"         -ForegroundColor Gray
+    Write-Host "    Appliance Type:    $ApplianceType"    -ForegroundColor Gray
+    Write-Host "    Platform:          $Platform"         -ForegroundColor Gray
+    Write-Host "    Connectivity Path: $ConnectivityPath" -ForegroundColor Gray
+    Write-Host "    Private Link:      $PrivateLink"      -ForegroundColor Gray
     Write-Host ""
     Write-Host "  Total Endpoints Tested: $($script:TestResults.Count)" -ForegroundColor White
     Write-Host "    Passed: $($passed.Count)" -ForegroundColor Green
@@ -984,6 +1171,8 @@ function Write-Recommendations {
         [string]$Cloud,
         [string]$Scenario,
         [string]$ApplianceType,
+        [string]$Platform,
+        [string]$ConnectivityPath,
         [bool]$PrivateLink
     )
 
@@ -993,6 +1182,7 @@ function Write-Recommendations {
     $docLinks = @{
         'PublicCloudUrls'      = 'https://learn.microsoft.com/en-us/azure/migrate/migrate-appliance#public-cloud-urls'
         'GovCloudUrls'         = 'https://learn.microsoft.com/en-us/azure/migrate/migrate-appliance#government-cloud-urls'
+        'ChinaCloudUrls'       = 'https://learn.microsoft.com/en-us/azure/migrate/migrate-appliance-china'
         'PublicPrivateLink'    = 'https://learn.microsoft.com/en-us/azure/migrate/migrate-appliance#public-cloud-urls-for-private-link-connectivity'
         'GovPrivateLink'       = 'https://learn.microsoft.com/en-us/azure/migrate/migrate-appliance#government-cloud-urls-for-private-link-connectivity'
         'DeploymentScenarios'  = 'https://learn.microsoft.com/en-us/azure/migrate/migrate-appliance#deployment-scenarios'
@@ -1000,11 +1190,13 @@ function Write-Recommendations {
         'TroubleshootAppliance'= 'https://learn.microsoft.com/en-us/azure/migrate/troubleshoot-appliance'
         'PortAccess'           = 'https://learn.microsoft.com/en-us/azure/migrate/migrate-appliance#port-access'
         'ApplianceSetup'       = 'https://learn.microsoft.com/en-us/azure/migrate/how-to-set-up-appliance-vmware'
-        'CommonQuestions'       = 'https://learn.microsoft.com/en-us/azure/migrate/common-questions-appliance'
+        'CommonQuestions'      = 'https://learn.microsoft.com/en-us/azure/migrate/common-questions-appliance'
         'PrivateLinkSetup'     = 'https://learn.microsoft.com/en-us/azure/migrate/how-to-use-azure-migrate-with-private-endpoints'
         'AgentBasedMigration'  = 'https://learn.microsoft.com/en-us/azure/migrate/agent-based-migration-architecture'
         'ModernAppliance'      = 'https://learn.microsoft.com/en-us/azure/migrate/migrate-appliance'
         'TroubleshootNetwork'  = 'https://learn.microsoft.com/en-us/azure/migrate/troubleshoot-network-connectivity'
+        'ExpressRoute'         = 'https://learn.microsoft.com/en-us/azure/expressroute/expressroute-routing'
+        'ERMicrosoftPeering'   = 'https://learn.microsoft.com/en-us/azure/expressroute/expressroute-circuit-peerings#microsoftpeering'
     }
 
     # Print collected recommendations
@@ -1022,6 +1214,26 @@ function Write-Recommendations {
         foreach ($w in $script:Warnings) {
             Write-Host "  [!] $w" -ForegroundColor Yellow
         }
+    }
+
+    # ExpressRoute private peering warning
+    if ($ConnectivityPath -eq 'ExpressRoute-Private') {
+        Write-SubSection "ExpressRoute Private Peering Warning"
+        Write-Host @"
+  [IMPORTANT] ExpressRoute PRIVATE PEERING does NOT carry public Azure service endpoints.
+  Public Azure services (login.microsoftonline.com, management.azure.com, blob.core.windows.net,
+  servicebus.windows.net, etc.) are NOT reachable over ExpressRoute private peering by default.
+
+  To reach public Azure endpoints from an appliance on a private-peering-only network you must:
+    (a) Route internet-bound traffic through a hub firewall / NAT gateway that has internet access, OR
+    (b) Enable ExpressRoute Microsoft Peering for Azure public services, OR
+    (c) Deploy Azure Private Endpoints for each required Azure service and use Private Link
+
+  If your appliance connectivity test shows failures for Azure portal, Entra ID, or ARM endpoints,
+  this is the most likely cause.
+
+  Reference: $($docLinks.ExpressRoute)
+"@ -ForegroundColor Yellow
     }
 
     # General guidance
@@ -1066,6 +1278,13 @@ function Write-Recommendations {
      c. For PUBLIC endpoints: Ensure firewall allows *.prod.migration.windowsazure.us/.com on TCP/443
      d. Paste the exact failing URL into this tool's custom URL prompt to test it directly
      e. See: https://learn.microsoft.com/en-us/azure/migrate/troubleshoot-appliance
+
+  7. EXPRESSROUTE / VPN: If using ExpressRoute or VPN:
+     a. ExpressRoute PRIVATE peering does NOT carry public Azure service endpoints
+        -- Appliance needs internet access or private endpoints for Azure services
+     b. ExpressRoute MICROSOFT peering carries Azure public IPs -- verify BGP communities
+     c. VPN Gateway: ensure split tunneling or full-tunnel routes cover Azure IP ranges
+     d. Reference: $($docLinks.ExpressRoute)
 "@ -ForegroundColor Gray
 
     # Relevant documentation links
@@ -1078,21 +1297,28 @@ function Write-Recommendations {
     Write-Host "    $($docLinks.SimplifiedExperience)" -ForegroundColor Cyan
     Write-Host ""
 
-    if ($Cloud -eq 'Commercial') {
-        if ($PrivateLink) {
-            Write-Host "  Required URLs (Public Cloud - Private Link):" -ForegroundColor White
-            Write-Host "    $($docLinks.PublicPrivateLink)" -ForegroundColor Cyan
-        } else {
-            Write-Host "  Required URLs (Public Cloud):" -ForegroundColor White
-            Write-Host "    $($docLinks.PublicCloudUrls)" -ForegroundColor Cyan
+    switch ($Cloud) {
+        'Commercial' {
+            if ($PrivateLink) {
+                Write-Host "  Required URLs (Public Cloud - Private Link):" -ForegroundColor White
+                Write-Host "    $($docLinks.PublicPrivateLink)" -ForegroundColor Cyan
+            } else {
+                Write-Host "  Required URLs (Public Cloud):" -ForegroundColor White
+                Write-Host "    $($docLinks.PublicCloudUrls)" -ForegroundColor Cyan
+            }
         }
-    } else {
-        if ($PrivateLink) {
-            Write-Host "  Required URLs (Government Cloud - Private Link):" -ForegroundColor White
-            Write-Host "    $($docLinks.GovPrivateLink)" -ForegroundColor Cyan
-        } else {
-            Write-Host "  Required URLs (Government Cloud):" -ForegroundColor White
-            Write-Host "    $($docLinks.GovCloudUrls)" -ForegroundColor Cyan
+        'Government' {
+            if ($PrivateLink) {
+                Write-Host "  Required URLs (Government Cloud - Private Link):" -ForegroundColor White
+                Write-Host "    $($docLinks.GovPrivateLink)" -ForegroundColor Cyan
+            } else {
+                Write-Host "  Required URLs (Government Cloud):" -ForegroundColor White
+                Write-Host "    $($docLinks.GovCloudUrls)" -ForegroundColor Cyan
+            }
+        }
+        'China' {
+            Write-Host "  Required URLs (China - 21Vianet):" -ForegroundColor White
+            Write-Host "    $($docLinks.ChinaCloudUrls)" -ForegroundColor Cyan
         }
     }
 
@@ -1132,6 +1358,15 @@ function Write-Recommendations {
         Write-Host "  Troubleshoot Network Connectivity (Private Endpoints):" -ForegroundColor White
         Write-Host "    $($docLinks.TroubleshootNetwork)" -ForegroundColor Cyan
     }
+
+    if ($ConnectivityPath -match 'ExpressRoute') {
+        Write-Host ""
+        Write-Host "  ExpressRoute Circuit Peering:" -ForegroundColor White
+        Write-Host "    $($docLinks.ExpressRoute)" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "  ExpressRoute Microsoft Peering:" -ForegroundColor White
+        Write-Host "    $($docLinks.ERMicrosoftPeering)" -ForegroundColor Cyan
+    }
 }
 
 # ============================================================================
@@ -1143,6 +1378,8 @@ function Export-Report {
         [string]$Cloud,
         [string]$Scenario,
         [string]$ApplianceType,
+        [string]$Platform,
+        [string]$ConnectivityPath,
         [bool]$PrivateLink,
         [bool]$ProxyDetected
     )
@@ -1151,15 +1388,17 @@ function Export-Report {
 
     [void]$sb.AppendLine("=" * 80)
     [void]$sb.AppendLine("  Azure Migrate Appliance - Connectivity Troubleshooter Report")
-    [void]$sb.AppendLine("  Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+    [void]$sb.AppendLine("  Generated:      $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
     [void]$sb.AppendLine("  Script Version: $($script:ScriptVersion)")
-    [void]$sb.AppendLine("  Machine: $env:COMPUTERNAME")
+    [void]$sb.AppendLine("  Machine:        $env:COMPUTERNAME")
     [void]$sb.AppendLine("=" * 80)
     [void]$sb.AppendLine("")
     [void]$sb.AppendLine("CONFIGURATION:")
     [void]$sb.AppendLine("  Cloud:              $Cloud")
     [void]$sb.AppendLine("  Scenario:           $Scenario")
     [void]$sb.AppendLine("  Appliance Type:     $ApplianceType")
+    [void]$sb.AppendLine("  Platform:           $Platform")
+    [void]$sb.AppendLine("  Connectivity Path:  $ConnectivityPath")
     [void]$sb.AppendLine("  Private Link:       $PrivateLink")
     [void]$sb.AppendLine("  Proxy Detected:     $ProxyDetected")
     [void]$sb.AppendLine("  PowerShell Version: $($PSVersionTable.PSVersion)")
@@ -1213,6 +1452,24 @@ function Export-Report {
 
     [void]$sb.AppendLine("")
     [void]$sb.AppendLine("-" * 80)
+    [void]$sb.AppendLine("FIREWALL RULE SUMMARY:")
+    [void]$sb.AppendLine("-" * 80)
+    if ($failed.Count -gt 0) {
+        [void]$sb.AppendLine("")
+        [void]$sb.AppendLine("  [ACTION REQUIRED] Add these outbound TCP/443 firewall allow rules:")
+        $seenW = @{}
+        foreach ($f in $failed) {
+            if (-not $seenW.ContainsKey($f.WildcardPattern)) {
+                $seenW[$f.WildcardPattern] = $true
+                [void]$sb.AppendLine(("    Allow TCP/{0,-6} to {1}" -f $f.Port, $f.WildcardPattern))
+            }
+        }
+    } else {
+        [void]$sb.AppendLine("  No blocked endpoints — no action required.")
+    }
+
+    [void]$sb.AppendLine("")
+    [void]$sb.AppendLine("-" * 80)
     [void]$sb.AppendLine("WARNINGS:")
     [void]$sb.AppendLine("-" * 80)
     foreach ($w in $script:Warnings) {
@@ -1237,18 +1494,27 @@ function Export-Report {
     [void]$sb.AppendLine("  Simplified Experience:   https://learn.microsoft.com/en-us/azure/migrate/simplified-experience-for-azure-migrate")
     [void]$sb.AppendLine("  Troubleshoot Appliance:  https://learn.microsoft.com/en-us/azure/migrate/troubleshoot-appliance")
     [void]$sb.AppendLine("  Port Access:             https://learn.microsoft.com/en-us/azure/migrate/migrate-appliance#port-access")
-    if ($Cloud -eq 'Commercial' -and -not $PrivateLink) {
-        [void]$sb.AppendLine("  Required URLs:           https://learn.microsoft.com/en-us/azure/migrate/migrate-appliance#public-cloud-urls")
+
+    switch ($Cloud) {
+        'Commercial' {
+            if (-not $PrivateLink) {
+                [void]$sb.AppendLine("  Required URLs:           https://learn.microsoft.com/en-us/azure/migrate/migrate-appliance#public-cloud-urls")
+            } else {
+                [void]$sb.AppendLine("  Required URLs (PL):      https://learn.microsoft.com/en-us/azure/migrate/migrate-appliance#public-cloud-urls-for-private-link-connectivity")
+            }
+        }
+        'Government' {
+            if (-not $PrivateLink) {
+                [void]$sb.AppendLine("  Required URLs (Gov):     https://learn.microsoft.com/en-us/azure/migrate/migrate-appliance#government-cloud-urls")
+            } else {
+                [void]$sb.AppendLine("  Required URLs (Gov PL):  https://learn.microsoft.com/en-us/azure/migrate/migrate-appliance#government-cloud-urls-for-private-link-connectivity")
+            }
+        }
+        'China' {
+            [void]$sb.AppendLine("  Required URLs (China):   https://learn.microsoft.com/en-us/azure/migrate/migrate-appliance-china")
+        }
     }
-    if ($Cloud -eq 'Commercial' -and $PrivateLink) {
-        [void]$sb.AppendLine("  Required URLs (PL):      https://learn.microsoft.com/en-us/azure/migrate/migrate-appliance#public-cloud-urls-for-private-link-connectivity")
-    }
-    if ($Cloud -eq 'Government' -and -not $PrivateLink) {
-        [void]$sb.AppendLine("  Required URLs (Gov):     https://learn.microsoft.com/en-us/azure/migrate/migrate-appliance#government-cloud-urls")
-    }
-    if ($Cloud -eq 'Government' -and $PrivateLink) {
-        [void]$sb.AppendLine("  Required URLs (Gov PL):  https://learn.microsoft.com/en-us/azure/migrate/migrate-appliance#government-cloud-urls-for-private-link-connectivity")
-    }
+
     [void]$sb.AppendLine("  Private Endpoints:       https://learn.microsoft.com/en-us/azure/migrate/how-to-use-azure-migrate-with-private-endpoints")
     [void]$sb.AppendLine("  Appliance FAQ:           https://learn.microsoft.com/en-us/azure/migrate/common-questions-appliance")
     [void]$sb.AppendLine("")
@@ -1384,11 +1650,21 @@ function Main {
     # ----- User Prompts -----
     Write-Section "DEPLOYMENT SCENARIO SELECTION"
 
+    # Cloud selection — now includes China (21Vianet)
     $cloudSel = Get-MenuSelection -Prompt "Which Azure cloud are you deploying to?" `
-        -Options @("Commercial Azure (Public Cloud)", "Azure Government") `
+        -Options @(
+            "Commercial Azure (Public Cloud)",
+            "Azure Government (US Gov)",
+            "Azure China (21Vianet)"
+        ) `
         -HelpText "Select the Azure cloud environment for your deployment."
-    $cloud = if ($cloudSel -eq 1) { 'Commercial' } else { 'Government' }
+    $cloud = switch ($cloudSel) {
+        1 { 'Commercial' }
+        2 { 'Government' }
+        3 { 'China' }
+    }
 
+    # Scenario
     $scenarioSel = Get-MenuSelection -Prompt "Which deployment scenario are you using?" `
         -Options @(
             "Azure Migrate VMware Agentless (discovery, assessment, and agentless migration)",
@@ -1402,6 +1678,7 @@ function Main {
         3 { 'AgentBasedModern' }
     }
 
+    # Appliance type
     $applianceTypeSel = Get-MenuSelection -Prompt "What type of appliance are you troubleshooting?" `
         -Options @(
             "Assessment / Discovery appliance",
@@ -1410,10 +1687,63 @@ function Main {
         -HelpText "Assessment appliance is for discovery and assessment. Replication appliance is for migration."
     $applianceType = if ($applianceTypeSel -eq 1) { 'Assessment' } else { 'Replication' }
 
+    # Platform (NEW in v2.0)
+    $platformSel = Get-MenuSelection -Prompt "Which source platform are you discovering/migrating?" `
+        -Options @(
+            "VMware vSphere",
+            "Hyper-V",
+            "Physical / Other Cloud (AWS, GCP, bare-metal)"
+        ) `
+        -HelpText "Select the source platform the appliance will connect to."
+    $platform = switch ($platformSel) {
+        1 { 'VMware' }
+        2 { 'HyperV' }
+        3 { 'Physical' }
+    }
+
+    # Private Link
     $privateLinkSel = Get-MenuSelection -Prompt "Are you using Azure Private Link / Private Endpoints?" `
         -Options @("No (public connectivity)", "Yes (private endpoints)") `
         -HelpText "See: https://learn.microsoft.com/en-us/azure/migrate/how-to-use-azure-migrate-with-private-endpoints"
     $privateLink = $privateLinkSel -eq 2
+
+    # Connectivity path (NEW in v2.0)
+    $connPathSel = Get-MenuSelection -Prompt "How does this appliance connect to Azure?" `
+        -Options @(
+            "Direct internet (no proxy)",
+            "Internet via proxy",
+            "ExpressRoute (private peering)",
+            "ExpressRoute (Microsoft peering)",
+            "VPN Gateway"
+        ) `
+        -HelpText "Select the network path used by this appliance to reach Azure services."
+    $connectivityPath = switch ($connPathSel) {
+        1 { 'DirectInternet' }
+        2 { 'InternetViaProxy' }
+        3 { 'ExpressRoute-Private' }
+        4 { 'ExpressRoute-Microsoft' }
+        5 { 'VPNGateway' }
+    }
+
+    # ExpressRoute private peering early warning
+    if ($connectivityPath -eq 'ExpressRoute-Private') {
+        Write-Host ""
+        Write-Host "  *** WARNING: ExpressRoute PRIVATE PEERING ***" -ForegroundColor Red
+        Write-Host "  ExpressRoute private peering does NOT carry public Azure service endpoints." -ForegroundColor Red
+        Write-Host "  Azure Migrate endpoints (login.microsoftonline.com, management.azure.com," -ForegroundColor Red
+        Write-Host "  servicebus.windows.net, etc.) are PUBLIC endpoints and are NOT routed over" -ForegroundColor Red
+        Write-Host "  ExpressRoute private peering by default." -ForegroundColor Red
+        Write-Host ""
+        Write-Host "  Your appliance will need one of the following to reach Azure services:" -ForegroundColor Yellow
+        Write-Host "    (a) Internet access (direct or via proxy / NAT gateway)" -ForegroundColor Yellow
+        Write-Host "    (b) ExpressRoute Microsoft Peering for Azure public IPs" -ForegroundColor Yellow
+        Write-Host "    (c) Azure Private Endpoints for each Azure Migrate service" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  Connectivity tests will likely fail if none of the above are in place." -ForegroundColor Yellow
+        Write-Host ""
+        [void]$script:Warnings.Add("ExpressRoute PRIVATE PEERING selected. Public Azure service endpoints are NOT carried over private peering. Appliance needs internet access or private endpoints.")
+        Read-Host "  Press Enter to continue anyway"
+    }
 
     # ----- Custom URLs (error messages, auto-update endpoints, etc.) -----
     $customUrls = [System.Collections.ArrayList]::new()
@@ -1426,9 +1756,8 @@ function Main {
     do {
         $customInput = Read-Host "  URL"
         if ($customInput -and $customInput.Trim()) {
-            $trimmed = $customInput.Trim()
-            # Strip protocol prefix and trailing slashes to extract hostname
-            $hostPart = $trimmed -replace '^https?://' , '' -replace '/.*$', ''
+            $trimmed  = $customInput.Trim()
+            $hostPart = $trimmed -replace '^https?://', '' -replace '/.*$', ''
             if ($hostPart) {
                 [void]$customUrls.Add(@{
                     Host     = $hostPart
@@ -1442,12 +1771,17 @@ function Main {
         }
     } while ($customInput -and $customInput.Trim())
 
+    # Auto-update GUID URL helper (NEW in v2.0)
+    Get-AutoUpdateGuidUrl -CustomUrls $customUrls
+
     # ----- Summary -----
     Write-Section "SELECTED CONFIGURATION"
-    Write-Host "    Cloud:          $cloud" -ForegroundColor White
-    Write-Host "    Scenario:       $scenario" -ForegroundColor White
-    Write-Host "    Appliance Type: $applianceType" -ForegroundColor White
-    Write-Host "    Private Link:   $privateLink" -ForegroundColor White
+    Write-Host "    Cloud:             $cloud"            -ForegroundColor White
+    Write-Host "    Scenario:          $scenario"         -ForegroundColor White
+    Write-Host "    Appliance Type:    $applianceType"    -ForegroundColor White
+    Write-Host "    Platform:          $platform"         -ForegroundColor White
+    Write-Host "    Connectivity Path: $connectivityPath" -ForegroundColor White
+    Write-Host "    Private Link:      $privateLink"      -ForegroundColor White
     Write-Host ""
     Write-Host "  Press Enter to begin connectivity checks or Ctrl+C to cancel..." -ForegroundColor Gray
     Read-Host
@@ -1464,8 +1798,12 @@ function Main {
     # ----- Basic Connectivity -----
     Test-BasicConnectivity
 
+    # ----- Platform Source Connectivity (NEW in v2.0) -----
+    Test-PlatformPorts -Platform $platform
+
     # ----- Build URL List -----
-    $urlList = Get-UrlDefinitions -Cloud $cloud -Scenario $scenario -ApplianceType $applianceType -PrivateLink $privateLink
+    $urlList = Get-UrlDefinitions -Cloud $cloud -Scenario $scenario -ApplianceType $applianceType `
+        -Platform $platform -PrivateLink $privateLink
 
     if ($urlList.Count -eq 0) {
         Write-Host ""
@@ -1491,13 +1829,19 @@ function Main {
     }
 
     # ----- Results Summary -----
-    Write-ResultsSummary -Cloud $cloud -Scenario $scenario -ApplianceType $applianceType -PrivateLink $privateLink
+    Write-ResultsSummary -Cloud $cloud -Scenario $scenario -ApplianceType $applianceType `
+        -Platform $platform -ConnectivityPath $connectivityPath -PrivateLink $privateLink
 
     # ----- Recommendations -----
-    Write-Recommendations -Cloud $cloud -Scenario $scenario -ApplianceType $applianceType -PrivateLink $privateLink
+    Write-Recommendations -Cloud $cloud -Scenario $scenario -ApplianceType $applianceType `
+        -Platform $platform -ConnectivityPath $connectivityPath -PrivateLink $privateLink
+
+    # ----- Firewall Rule Summary (NEW in v2.0) -----
+    Write-FirewallRuleSummary
 
     # ----- Export Report -----
     Export-Report -Cloud $cloud -Scenario $scenario -ApplianceType $applianceType `
+        -Platform $platform -ConnectivityPath $connectivityPath `
         -PrivateLink $privateLink -ProxyDetected $proxyDetected
 
     # ----- Final Banner -----
