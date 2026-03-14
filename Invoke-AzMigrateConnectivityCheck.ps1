@@ -54,7 +54,7 @@ $ProgressPreference    = 'SilentlyContinue'
 $script:TestResults    = [System.Collections.ArrayList]::new()
 $script:Recommendations = [System.Collections.ArrayList]::new()
 $script:Warnings       = [System.Collections.ArrayList]::new()
-$script:ScriptVersion  = '3.0'
+$script:ScriptVersion  = '4.0'
 $script:TcpTimeoutMs   = 5000
 $script:HttpTimeoutMs  = 10000
 $script:ReportPath     = Join-Path $PSScriptRoot ("AzMigrate-ConnectivityReport_{0}.txt" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
@@ -1637,6 +1637,832 @@ See: https://learn.microsoft.com/en-us/azure/migrate/troubleshoot-network-connec
 
 
 # ============================================================================
+
+# ============================================================================
+# v4.0 ADDITIONAL RESULT STORES
+# ============================================================================
+$script:AzureHealthResult    = $null
+$script:ApplianceHealthResult = $null
+$script:DotNetResult          = $null
+$script:NatIpResult           = $null
+
+
+# ============================================================================
+# v4.0 ADDITIONS — Features 1-8
+# ============================================================================
+
+# ── Feature 1: Azure Service Health Check ────────────────────────────────────
+function Test-AzureServiceHealth {
+    param(
+        [ValidateSet('Commercial','Government','China')]
+        [string]$Cloud = 'Commercial'
+    )
+
+    Write-Section "AZURE SERVICE HEALTH CHECK"
+    Write-Host "  Checking whether Microsoft Azure itself is currently experiencing an outage." -ForegroundColor Gray
+    Write-Host "  If Azure is down, network tests below may show failures that are NOT your fault." -ForegroundColor Gray
+    Write-Host ""
+
+    $statusUrl = switch ($Cloud) {
+        'Government' { 'https://status.azure.us/api/v2/status.json' }
+        'China'      { 'https://status.azure.cn/api/v2/status.json' }
+        default      { 'https://status.azure.com/api/v2/status.json' }
+    }
+
+    $portalUrl = switch ($Cloud) {
+        'Government' { 'https://status.azure.us' }
+        'China'      { 'https://status.azure.cn' }
+        default      { 'https://status.azure.com' }
+    }
+
+    $result = @{ Status = 'Unknown'; Indicator = 'unknown'; Description = ''; ComponentIssues = @() }
+    $req = $null; $resp = $null
+
+    try {
+        $req          = [System.Net.HttpWebRequest]::Create($statusUrl)
+        $req.Method   = 'GET'
+        $req.Timeout  = 10000
+        $req.UserAgent = 'AzureMigrateConnectivityChecker/4.0'
+        $resp         = $req.GetResponse()
+
+        $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
+        $json   = $reader.ReadToEnd()
+        $reader.Close(); $reader.Dispose()
+
+        # Parse JSON manually (PS 5.1 compatible)
+        $parsed = $json | ConvertFrom-Json -ErrorAction SilentlyContinue
+
+        if ($parsed) {
+            $indicator   = $parsed.status.indicator
+            $description = $parsed.status.description
+
+            $result.Indicator   = $indicator
+            $result.Description = $description
+
+            switch ($indicator) {
+                'none' {
+                    $result.Status = 'Healthy'
+                    Write-Host "  [PASS] Azure is FULLY OPERATIONAL — no active incidents." -ForegroundColor Green
+                    Write-Host "  Status: $description" -ForegroundColor Green
+                }
+                'minor' {
+                    $result.Status = 'Minor'
+                    Write-Host "  [WARN] Azure has a MINOR incident in progress." -ForegroundColor Yellow
+                    Write-Host "  Status: $description" -ForegroundColor Yellow
+                    Write-Host "  This may or may not affect Azure Migrate. Check: $portalUrl" -ForegroundColor Yellow
+                    [void]$script:Warnings.Add("Azure has an active minor incident. Some failures below may be Azure-side, not your network. Check $portalUrl")
+                }
+                { $_ -in 'major','critical' } {
+                    $result.Status = 'Outage'
+                    Write-Host "  [FAIL] AZURE OUTAGE DETECTED — $($indicator.ToUpper()) incident in progress." -ForegroundColor Red
+                    Write-Host "  Status: $description" -ForegroundColor Red
+                    Write-Host ""
+                    Write-Host "  IMPORTANT: Connectivity test failures below may be caused by this Azure outage," -ForegroundColor Red
+                    Write-Host "  NOT by your network. Do NOT raise firewall change requests until Azure recovers." -ForegroundColor Red
+                    Write-Host "  Monitor: $portalUrl" -ForegroundColor Cyan
+                    [void]$script:Recommendations.Add("AZURE OUTAGE IN PROGRESS ($indicator): Any connectivity failures may be Azure-side. Monitor $portalUrl before making network changes.")
+                }
+                default {
+                    $result.Status = 'Unknown'
+                    Write-Host "  [INFO] Azure status: $description (indicator: $indicator)" -ForegroundColor Gray
+                }
+            }
+        } else {
+            Write-Host "  [INFO] Could not parse Azure status response — proceeding with tests." -ForegroundColor Gray
+        }
+
+    } catch [System.Net.WebException] {
+        $result.Status = 'Unreachable'
+        Write-Host "  [WARN] Could not reach Azure status page ($statusUrl)." -ForegroundColor Yellow
+        Write-Host "  This could mean no internet access, or status.azure.com is blocked by the network." -ForegroundColor Yellow
+        Write-Host "  Proceeding with connectivity tests — treat results with caution." -ForegroundColor Yellow
+    } catch {
+        Write-Host "  [WARN] Azure health check error: $($_.Exception.Message)" -ForegroundColor Yellow
+    } finally {
+        if ($resp) { try { $resp.Close(); $resp.Dispose() } catch {} }
+        $req = $null; $resp = $null
+    }
+
+    $script:AzureHealthResult = $result
+    Write-Host ""
+}
+
+# ── Feature 2: Appliance Health API Check ────────────────────────────────────
+function Test-ApplianceHealthApi {
+    Write-Section "APPLIANCE CONFIGURATION MANAGER HEALTH CHECK"
+    Write-Host "  Checking whether the Appliance Configuration Manager web portal is running" -ForegroundColor Gray
+    Write-Host "  and responding on this machine. This is the tool used to register the" -ForegroundColor Gray
+    Write-Host "  appliance and run connectivity checks (https://localhost:44368)." -ForegroundColor Gray
+    Write-Host ""
+
+    $result = @{ PortOpen = $false; ApiResponding = $false; HealthStatus = 'Unknown'; Detail = '' }
+
+    # Step 1: TCP check on port 44368
+    Write-Host "  Step 1: Checking if Config Manager web portal is listening on port 44368..." -ForegroundColor White
+    $tcpClient = $null
+    try {
+        $tcpClient = New-Object System.Net.Sockets.TcpClient
+        $task      = $tcpClient.ConnectAsync('127.0.0.1', 44368)
+        $connected = $task.Wait(3000)
+        if ($connected -and -not $task.IsFaulted) {
+            $result.PortOpen = $true
+            Write-Host "  [PASS] Port 44368 is open — Config Manager web server is running." -ForegroundColor Green
+        } else {
+            Write-Host "  [FAIL] Port 44368 is NOT responding." -ForegroundColor Red
+            Write-Host "         The Appliance Configuration Manager web server is not running." -ForegroundColor Red
+            Write-Host "         This means the appliance software may not be installed, or the" -ForegroundColor Red
+            Write-Host "         IIS/Kestrel web server has crashed." -ForegroundColor Red
+            Write-Host ""
+            Write-Host "  To fix: Open Services.msc and look for 'Microsoft Azure Appliance' services." -ForegroundColor Yellow
+            Write-Host "          Try restarting them, or reboot the appliance." -ForegroundColor Yellow
+            [void]$script:Recommendations.Add("APPLIANCE CONFIG MANAGER DOWN: Port 44368 not responding. The appliance web server has crashed or is not installed. Check Services.msc for Azure Migrate/Appliance services.")
+        }
+    } catch {
+        Write-Host "  [WARN] Could not test port 44368: $($_.Exception.Message)" -ForegroundColor Yellow
+    } finally {
+        if ($tcpClient) { try { $tcpClient.Close(); $tcpClient.Dispose() } catch {} }
+        $tcpClient = $null
+    }
+
+    # Step 2: HTTPS health API call (only if port is open)
+    if ($result.PortOpen) {
+        Write-Host ""
+        Write-Host "  Step 2: Querying appliance health API..." -ForegroundColor White
+        $req = $null; $resp = $null
+        try {
+            # Ignore self-signed cert (appliance uses self-signed)
+            [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+
+            $req         = [System.Net.HttpWebRequest]::Create('https://localhost:44368/api/appliance/health')
+            $req.Method  = 'GET'
+            $req.Timeout = 8000
+            $req.UserAgent = 'AzureMigrateConnectivityChecker/4.0'
+
+            try {
+                $resp       = $req.GetResponse()
+                $statusCode = [int]$resp.StatusCode
+                $reader     = New-Object System.IO.StreamReader($resp.GetResponseStream())
+                $body       = $reader.ReadToEnd()
+                $reader.Close(); $reader.Dispose()
+
+                if ($statusCode -eq 200) {
+                    $result.ApiResponding = $true
+                    $result.HealthStatus  = 'Responding'
+                    Write-Host "  [PASS] Health API responded (HTTP 200)." -ForegroundColor Green
+
+                    # Try to parse health status
+                    try {
+                        $healthData = $body | ConvertFrom-Json -ErrorAction SilentlyContinue
+                        if ($healthData) {
+                            $overallHealth = $healthData.overallHealth -or $healthData.status -or $healthData.State
+                            if ($overallHealth) {
+                                Write-Host "  Appliance health status: $overallHealth" -ForegroundColor $(
+                                    if ($overallHealth -match 'healthy|ok|success|running' ) { 'Green' }
+                                    elseif ($overallHealth -match 'warn|degraded') { 'Yellow' }
+                                    else { 'Red' }
+                                )
+                                $result.HealthStatus = $overallHealth
+                            }
+                        }
+                    } catch {}
+                    Write-Host "  The Config Manager is running and accepting requests." -ForegroundColor Green
+                } else {
+                    Write-Host "  [WARN] Health API returned HTTP $statusCode." -ForegroundColor Yellow
+                    $result.HealthStatus = "HTTP $statusCode"
+                }
+            } catch [System.Net.WebException] {
+                $webEx = $_.Exception
+                if ($webEx.Response) {
+                    $code = [int]$webEx.Response.StatusCode
+                    if ($code -in @(401, 403)) {
+                        $result.ApiResponding = $true
+                        $result.HealthStatus  = 'Running (auth required)'
+                        Write-Host "  [PASS] Config Manager is running (HTTP $code — auth required, which is expected)." -ForegroundColor Green
+                    } else {
+                        Write-Host "  [WARN] Config Manager HTTP $code`: $($webEx.Message)" -ForegroundColor Yellow
+                    }
+                } else {
+                    Write-Host "  [WARN] Could not reach health API: $($webEx.Message)" -ForegroundColor Yellow
+                    Write-Host "  The web server port is open but not responding to API calls." -ForegroundColor Yellow
+                    Write-Host "  The appliance software may be starting up or in an error state." -ForegroundColor Yellow
+                }
+            }
+        } catch {
+            Write-Host "  [WARN] Health API check error: $($_.Exception.Message)" -ForegroundColor Yellow
+        } finally {
+            if ($resp) { try { $resp.Close(); $resp.Dispose() } catch {} }
+            # Reset cert validation
+            [Net.ServicePointManager]::ServerCertificateValidationCallback = $null
+            $req = $null; $resp = $null
+        }
+    }
+
+    $script:ApplianceHealthResult = $result
+    Write-Host ""
+}
+
+# ── Feature 3: .NET Framework Version Check ──────────────────────────────────
+function Test-DotNetVersion {
+    Write-Section ".NET FRAMEWORK VERSION CHECK"
+    Write-Host "  Azure Migrate appliance requires .NET Framework 4.7.2 or higher." -ForegroundColor Gray
+    Write-Host "  Missing or outdated .NET causes silent failures that can look like" -ForegroundColor Gray
+    Write-Host "  network connectivity problems." -ForegroundColor Gray
+    Write-Host ""
+
+    $result = @{ Version = 'Unknown'; Release = 0; Pass = $false; Detail = '' }
+
+    # .NET version from registry (most reliable method)
+    $regPath = 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full'
+    try {
+        if (Test-Path $regPath) {
+            $release = (Get-ItemProperty -Path $regPath -Name 'Release' -ErrorAction SilentlyContinue).Release
+            $result.Release = $release
+
+            # Release number → version mapping
+            $versionStr = switch ($true) {
+                ($release -ge 533320) { '4.8.1 or later' }
+                ($release -ge 528040) { '4.8' }
+                ($release -ge 461808) { '4.7.2' }
+                ($release -ge 461308) { '4.7.1' }
+                ($release -ge 460798) { '4.7' }
+                ($release -ge 394802) { '4.6.2' }
+                ($release -ge 394254) { '4.6.1' }
+                ($release -ge 393295) { '4.6' }
+                default               { "Below 4.6 (Release key: $release)" }
+            }
+            $result.Version = $versionStr
+
+            # 4.7.2 = release key 461808
+            if ($release -ge 461808) {
+                $result.Pass = $true
+                Write-Host "  [PASS] .NET Framework $versionStr is installed (Release: $release)" -ForegroundColor Green
+                Write-Host "  This meets the Azure Migrate minimum requirement of .NET 4.7.2." -ForegroundColor Green
+            } else {
+                $result.Pass = $false
+                Write-Host "  [FAIL] .NET Framework $versionStr is installed (Release: $release)" -ForegroundColor Red
+                Write-Host "  Azure Migrate requires .NET Framework 4.7.2 or higher." -ForegroundColor Red
+                Write-Host "  This WILL cause appliance failures regardless of network health." -ForegroundColor Red
+                Write-Host ""
+                Write-Host "  TO FIX: Download and install .NET Framework 4.8 from:" -ForegroundColor Yellow
+                Write-Host "  https://dotnet.microsoft.com/download/dotnet-framework/net48" -ForegroundColor Cyan
+                Write-Host "  Then reboot the machine and re-run this script." -ForegroundColor Yellow
+                [void]$script:Recommendations.Add(".NET Framework $versionStr is BELOW the required 4.7.2 minimum. Install .NET 4.8 from https://dotnet.microsoft.com/download/dotnet-framework/net48 and reboot.")
+            }
+        } else {
+            Write-Host "  [WARN] .NET Framework 4.x registry key not found." -ForegroundColor Yellow
+            Write-Host "  .NET Framework 4.x may not be installed on this machine." -ForegroundColor Yellow
+            Write-Host "  Azure Migrate requires .NET 4.7.2+. Install it before proceeding." -ForegroundColor Yellow
+            [void]$script:Recommendations.Add(".NET Framework 4.x not detected. Azure Migrate requires 4.7.2+. Install from https://dotnet.microsoft.com/download/dotnet-framework/net48")
+        }
+    } catch {
+        Write-Host "  [WARN] Could not read .NET version from registry: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
+    # Also check .NET version via clrver or PowerShell runtime as secondary confirmation
+    Write-Host ""
+    Write-Host "  PowerShell .NET runtime: $([System.Runtime.InteropServices.RuntimeEnvironment]::GetSystemVersion())" -ForegroundColor Gray
+    Write-Host "  CLR version in use:      $([System.Environment]::Version)" -ForegroundColor Gray
+
+    $script:DotNetResult = $result
+    Write-Host ""
+}
+
+# ── Feature 4: Outbound NAT IP Capture ───────────────────────────────────────
+function Get-OutboundNatIp {
+    Write-Section "OUTBOUND NAT IP ADDRESS"
+    Write-Host "  This captures the PUBLIC IP address that Microsoft Azure sees when this" -ForegroundColor Gray
+    Write-Host "  appliance connects to the internet. This is the IP your firewall team" -ForegroundColor Gray
+    Write-Host "  can look up in firewall logs to trace exactly where traffic is going." -ForegroundColor Gray
+    Write-Host "  It may be different from the machine's local IP address (10.x, 192.168.x)" -ForegroundColor Gray
+    Write-Host "  if the machine is behind NAT, a proxy, or a firewall." -ForegroundColor Gray
+    Write-Host ""
+
+    $result = @{ PublicIp = 'Unknown'; LocalIp = 'Unknown'; IsBehindNat = $false }
+
+    # Get local IP
+    try {
+        $adapters = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.IPAddress -notmatch '^127\.' -and $_.PrefixOrigin -ne 'WellKnown' } |
+            Select-Object -First 1
+        if ($adapters) { $result.LocalIp = $adapters.IPAddress }
+    } catch {
+        try {
+            $result.LocalIp = ([System.Net.Dns]::GetHostAddresses([System.Net.Dns]::GetHostName()) |
+                Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1).IPAddressToString
+        } catch {}
+    }
+
+    # Try multiple public IP services in order (resilience)
+    $ipServices = @(
+        'https://api.ipify.org',
+        'https://ifconfig.me/ip',
+        'https://icanhazip.com',
+        'https://checkip.amazonaws.com'
+    )
+
+    $publicIp = $null
+    foreach ($svc in $ipServices) {
+        $req = $null; $resp = $null
+        try {
+            $req         = [System.Net.HttpWebRequest]::Create($svc)
+            $req.Method  = 'GET'
+            $req.Timeout = 8000
+            $req.UserAgent = 'AzureMigrateConnectivityChecker/4.0'
+            $resp        = $req.GetResponse()
+            $reader      = New-Object System.IO.StreamReader($resp.GetResponseStream())
+            $publicIp    = $reader.ReadToEnd().Trim()
+            $reader.Close(); $reader.Dispose()
+            if ($publicIp -match '^\d+\.\d+\.\d+\.\d+$') { break }
+            $publicIp = $null
+        } catch {
+            $publicIp = $null
+        } finally {
+            if ($resp) { try { $resp.Close(); $resp.Dispose() } catch {} }
+            $req = $null; $resp = $null
+        }
+    }
+
+    if ($publicIp) {
+        $result.PublicIp    = $publicIp
+        $result.IsBehindNat = ($publicIp -ne $result.LocalIp)
+
+        Write-Host "  Local (internal) IP address : $($result.LocalIp)" -ForegroundColor Gray
+        Write-Host "  Public (outbound NAT) IP    : $publicIp" -ForegroundColor Cyan
+        Write-Host ""
+
+        if ($result.IsBehindNat) {
+            Write-Host "  [INFO] This machine is behind NAT — traffic leaves via a different public IP." -ForegroundColor White
+            Write-Host "  When reviewing firewall logs, look for traffic FROM: $publicIp" -ForegroundColor White
+            Write-Host "  Share this IP with your network team when requesting firewall rule changes." -ForegroundColor White
+        } else {
+            Write-Host "  [INFO] Local IP matches public IP — machine may have a direct internet connection." -ForegroundColor White
+        }
+
+        # Rough geolocation check
+        $geoReq = $null; $geoResp = $null
+        try {
+            $geoReq        = [System.Net.HttpWebRequest]::Create("https://ipapi.co/$publicIp/json/")
+            $geoReq.Method = 'GET'
+            $geoReq.Timeout = 6000
+            $geoReq.UserAgent = 'AzureMigrateConnectivityChecker/4.0'
+            $geoResp       = $geoReq.GetResponse()
+            $geoReader     = New-Object System.IO.StreamReader($geoResp.GetResponseStream())
+            $geoJson       = $geoReader.ReadToEnd()
+            $geoReader.Close(); $geoReader.Dispose()
+            $geo           = $geoJson | ConvertFrom-Json -ErrorAction SilentlyContinue
+            if ($geo -and $geo.country_name) {
+                Write-Host "  IP Location: $($geo.city), $($geo.region), $($geo.country_name) — ISP: $($geo.org)" -ForegroundColor Gray
+            }
+        } catch {}
+        finally {
+            if ($geoResp) { try { $geoResp.Close(); $geoResp.Dispose() } catch {} }
+            $geoReq = $null; $geoResp = $null
+        }
+
+    } else {
+        Write-Host "  [WARN] Could not determine public IP address." -ForegroundColor Yellow
+        Write-Host "  All public IP lookup services were unreachable." -ForegroundColor Yellow
+        Write-Host "  This may indicate no outbound internet access from this machine." -ForegroundColor Yellow
+        [void]$script:Warnings.Add("Could not determine outbound public IP — all IP lookup services unreachable. Possible: no internet access, or all outbound traffic is blocked.")
+    }
+
+    $script:NatIpResult = $result
+    Write-Host ""
+}
+
+# ── Feature 5: Parallel Endpoint Testing ─────────────────────────────────────
+function Invoke-ConnectivityTestsParallel {
+    param(
+        [System.Collections.ArrayList]$UrlList
+    )
+
+    Write-Section "ENDPOINT CONNECTIVITY TESTS (Parallel)"
+    Write-Host ""
+    Write-Host "  Testing $($UrlList.Count) endpoints in parallel for speed." -ForegroundColor White
+    Write-Host "  (Simulating the same HTTPS calls the Azure Migrate appliance makes)" -ForegroundColor Gray
+    Write-Host ""
+
+    # Use runspaces for parallel execution (PS 5.1 compatible, no Start-Job overhead)
+    $runspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, 8)
+    $runspacePool.Open()
+
+    $jobs = [System.Collections.ArrayList]::new()
+
+    $scriptBlock = {
+        param($HostName, $Port, $TcpTimeout, $HttpTimeout)
+
+        $result = @{
+            HostName    = $HostName
+            Port        = $Port
+            DnsPass     = $false
+            DnsDetail   = ''
+            DnsAddresses= @()
+            TcpPass     = $false
+            TcpDetail   = ''
+            TcpLatencyMs= -1
+            HttpsPass   = $false
+            HttpsDetail = ''
+            HttpsStatus = 0
+            CertIssuer  = ''
+        }
+
+        # DNS
+        try {
+            $addrs = [System.Net.Dns]::GetHostAddresses($HostName)
+            if ($addrs.Count -gt 0) {
+                $result.DnsPass      = $true
+                $result.DnsAddresses = $addrs | ForEach-Object { $_.IPAddressToString }
+                $result.DnsDetail    = "Resolved: $($result.DnsAddresses -join ', ')"
+            } else {
+                $result.DnsDetail = "No addresses returned"
+            }
+        } catch {
+            $result.DnsDetail = $_.Exception.Message
+        }
+
+        if (-not $result.DnsPass) { return $result }
+
+        # TCP
+        $tcpClient = $null
+        try {
+            $tcpClient = New-Object System.Net.Sockets.TcpClient
+            $sw        = [System.Diagnostics.Stopwatch]::StartNew()
+            $task      = $tcpClient.ConnectAsync($HostName, $Port)
+            $done      = $task.Wait($TcpTimeout)
+            $sw.Stop()
+            if ($done -and -not $task.IsFaulted) {
+                $result.TcpPass      = $true
+                $result.TcpLatencyMs = $sw.ElapsedMilliseconds
+                $result.TcpDetail    = "Connected in $($sw.ElapsedMilliseconds)ms"
+            } else {
+                $result.TcpDetail = if ($task.IsFaulted) { $task.Exception.InnerException.Message } else { "Timed out after ${TcpTimeout}ms" }
+            }
+        } catch {
+            $result.TcpDetail = $_.Exception.Message
+        } finally {
+            if ($tcpClient) { try { $tcpClient.Close(); $tcpClient.Dispose() } catch {} }
+            $tcpClient = $null
+        }
+
+        if (-not $result.TcpPass) { return $result }
+
+        # HTTPS
+        $req = $null; $resp = $null
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            $req           = [System.Net.HttpWebRequest]::Create("https://$HostName")
+            $req.Method    = 'GET'
+            $req.Timeout   = $HttpTimeout
+            $req.UserAgent = 'AzureMigrateConnectivityChecker/4.0'
+            $sw2           = [System.Diagnostics.Stopwatch]::StartNew()
+            try {
+                $resp = $req.GetResponse()
+                $sw2.Stop()
+                $result.HttpsPass   = $true
+                $result.HttpsStatus = [int]$resp.StatusCode
+                $result.HttpsDetail = "HTTP $($result.HttpsStatus) in $($sw2.ElapsedMilliseconds)ms"
+                if ($req.ServicePoint.Certificate) {
+                    $result.CertIssuer = $req.ServicePoint.Certificate.Issuer
+                }
+                $resp.Close(); $resp.Dispose()
+            } catch [System.Net.WebException] {
+                $sw2.Stop()
+                $webEx = $_.Exception
+                if ($webEx.Response) {
+                    $code = [int]$webEx.Response.StatusCode
+                    if ($code -in @(400,401,403,404,405,500,502,503)) {
+                        $result.HttpsPass   = $true
+                        $result.HttpsStatus = $code
+                        $result.HttpsDetail = "HTTP $code in $($sw2.ElapsedMilliseconds)ms (network reachable)"
+                        if ($req.ServicePoint.Certificate) {
+                            $result.CertIssuer = $req.ServicePoint.Certificate.Issuer
+                        }
+                    } else {
+                        $result.HttpsDetail = "HTTP $code`: $($webEx.Message)"
+                    }
+                    if ($webEx.Response -is [System.Net.HttpWebResponse]) { $webEx.Response.Close() }
+                } else {
+                    $result.HttpsDetail = $webEx.Message
+                }
+            }
+        } catch {
+            $result.HttpsDetail = $_.Exception.Message
+        } finally {
+            if ($resp)  { try { $resp.Close();  $resp.Dispose()  } catch {} }
+            $req = $null; $resp = $null
+        }
+
+        return $result
+    }
+
+    # Submit all jobs
+    foreach ($entry in $UrlList) {
+        $ps = [System.Management.Automation.PowerShell]::Create()
+        $ps.RunspacePool = $runspacePool
+        [void]$ps.AddScript($scriptBlock)
+        [void]$ps.AddArgument($entry.Host)
+        [void]$ps.AddArgument($entry.Port)
+        [void]$ps.AddArgument($script:TcpTimeoutMs)
+        [void]$ps.AddArgument($script:HttpTimeoutMs)
+        $handle = $ps.BeginInvoke()
+        [void]$jobs.Add([PSCustomObject]@{
+            PS      = $ps
+            Handle  = $handle
+            Entry   = $entry
+        })
+    }
+
+    # Collect results with progress display
+    $currentCategory = ''
+    $completed = 0
+    $total     = $jobs.Count
+
+    foreach ($job in $jobs) {
+        $r     = $job.PS.EndInvoke($job.Handle)
+        $entry = $job.Entry
+        $completed++
+
+        if ($entry.Category -ne $currentCategory) {
+            $currentCategory = $entry.Category
+            Write-SubSection "$currentCategory"
+        }
+
+        $res = if ($r -is [System.Collections.IEnumerable]) { $r | Select-Object -First 1 } else { $r }
+
+        $dnsPass   = [bool]$res.DnsPass
+        $tcpPass   = [bool]$res.TcpPass
+        $httpsPass = [bool]$res.HttpsPass
+        $dnsDetail = $res.DnsDetail
+        $tcpDetail = $res.TcpDetail
+        $httpsDetail = $res.HttpsDetail
+
+        Write-Host "    [$completed/$total] $($entry.Host):$($entry.Port) ... " -NoNewline -ForegroundColor White
+        if ($dnsPass -and $tcpPass -and $httpsPass) {
+            Write-Host "PASS" -ForegroundColor Green
+        } elseif (-not $dnsPass) {
+            Write-Host "FAIL (DNS)" -ForegroundColor Red
+        } elseif (-not $tcpPass) {
+            Write-Host "FAIL (TCP BLOCKED)" -ForegroundColor Red
+        } else {
+            Write-Host "FAIL (HTTPS)" -ForegroundColor Red
+        }
+
+        Add-TestResult -Url $entry.Host -Port $entry.Port -Purpose $entry.Purpose `
+            -WildcardPattern $entry.Wildcard `
+            -DnsPass $dnsPass -DnsDetail $dnsDetail `
+            -TcpPass $tcpPass -TcpDetail $tcpDetail `
+            -HttpsPass $httpsPass -HttpsDetail $httpsDetail `
+            -Category $entry.Category
+
+        # Cleanup this runspace job
+        $job.PS.Dispose()
+    }
+
+    # Close the pool
+    $runspacePool.Close()
+    $runspacePool.Dispose()
+    $runspacePool = $null
+    $jobs         = $null
+}
+
+# ── Feature 6: Retry Logic for Flaky Connections ─────────────────────────────
+function Test-EndpointWithRetry {
+    param(
+        [string]$HostName,
+        [int]$Port,
+        [int]$MaxRetries = 3,
+        [int]$TimeoutMs  = 5000
+    )
+
+    $passCount = 0
+    $lastError = ''
+
+    for ($i = 1; $i -le $MaxRetries; $i++) {
+        $tcpClient = $null
+        try {
+            $tcpClient = New-Object System.Net.Sockets.TcpClient
+            $task      = $tcpClient.ConnectAsync($HostName, $Port)
+            $done      = $task.Wait($TimeoutMs)
+            if ($done -and -not $task.IsFaulted) {
+                $passCount++
+            } else {
+                $lastError = if ($task.IsFaulted) { $task.Exception.InnerException.Message } else { "Timeout" }
+            }
+        } catch {
+            $lastError = $_.Exception.Message
+        } finally {
+            if ($tcpClient) { try { $tcpClient.Close(); $tcpClient.Dispose() } catch {} }
+            $tcpClient = $null
+        }
+        if ($i -lt $MaxRetries) { Start-Sleep -Milliseconds 500 }
+    }
+
+    return [PSCustomObject]@{
+        HostName    = $HostName
+        Port        = $Port
+        PassCount   = $passCount
+        TotalTries  = $MaxRetries
+        Consistent  = ($passCount -eq $MaxRetries -or $passCount -eq 0)
+        Flaky       = ($passCount -gt 0 -and $passCount -lt $MaxRetries)
+        LastError   = $lastError
+    }
+}
+
+function Test-FlakyConnections {
+    # Re-test failed TCP endpoints with retry to identify flaky vs consistent failures
+    $failedTcp = $script:TestResults | Where-Object { $_.DnsPass -and -not $_.TcpPass } | Select-Object -First 5
+
+    if ($failedTcp.Count -eq 0) { return }
+
+    Write-Section "FLAP / INTERMITTENT CONNECTION TEST"
+    Write-Host "  Re-testing blocked endpoints 3 times each to determine if the block is" -ForegroundColor Gray
+    Write-Host "  consistent (definite firewall rule) or intermittent (packet loss / flapping)." -ForegroundColor Gray
+    Write-Host "  This helps your network team distinguish a hard block from a flaky connection." -ForegroundColor Gray
+    Write-Host ""
+
+    $flapFound = $false
+
+    foreach ($entry in $failedTcp) {
+        Write-Host "  Retrying: $($entry.Url):$($entry.Port) (3 attempts)" -ForegroundColor White
+        $retryResult = Test-EndpointWithRetry -HostName $entry.Url -Port $entry.Port -MaxRetries 3
+
+        if ($retryResult.Flaky) {
+            $flapFound = $true
+            Write-Host "    [FLAKY] $($retryResult.PassCount)/3 attempts succeeded." -ForegroundColor Yellow
+            Write-Host "    MEANING: This connection is INTERMITTENT — not a hard firewall block." -ForegroundColor Yellow
+            Write-Host "    This is typically caused by: packet loss, rate limiting, an overloaded" -ForegroundColor Yellow
+            Write-Host "    proxy, or a firewall rule that allows some traffic but not all." -ForegroundColor Yellow
+            Write-Host "    Ask your network team to check for packet loss or rate limiting rules," -ForegroundColor Yellow
+            Write-Host "    not just outright blocks." -ForegroundColor Yellow
+            [void]$script:Warnings.Add("FLAKY connection to $($entry.Url):$($entry.Port) — $($retryResult.PassCount)/3 retries succeeded. Check for packet loss or rate limiting, not just hard firewall blocks.")
+        } elseif ($retryResult.PassCount -eq 3) {
+            Write-Host "    [PASS on retry] All 3 retries succeeded — may have been a transient issue." -ForegroundColor Green
+            [void]$script:Warnings.Add("$($entry.Url) passed on retry (transient failure during main test). Re-run script to confirm.")
+        } else {
+            Write-Host "    [CONSISTENT BLOCK] 0/3 retries succeeded — this is a definite, consistent block." -ForegroundColor Red
+            Write-Host "    Your network team should look for an explicit DENY rule for this destination." -ForegroundColor Red
+        }
+        Write-Host ""
+    }
+
+    if (-not $flapFound) {
+        Write-Host "  All tested failures are CONSISTENT — no intermittent/flapping connections detected." -ForegroundColor White
+        Write-Host "  The blocks are definite firewall rules, not packet loss." -ForegroundColor White
+    }
+}
+
+# ── Feature 7: NTLM/Kerberos Proxy Auth Detection ────────────────────────────
+function Test-ProxyAuthType {
+    param([string]$ProxyString)
+
+    if (-not $ProxyString -or $ProxyString -match 'Direct access') { return }
+
+    # Parse proxy
+    $proxyHost = $null; $proxyPort = 8080
+    if ($ProxyString -match '(?:https?://)?([^:/\s]+)(?::(\d+))?') {
+        $proxyHost = $matches[1]
+        if ($matches[2]) { $proxyPort = [int]$matches[2] }
+    }
+    if (-not $proxyHost) { return }
+
+    Write-Section "PROXY AUTHENTICATION TYPE DETECTION"
+    Write-Host "  Detecting whether your proxy requires NTLM or Kerberos Windows authentication." -ForegroundColor Gray
+    Write-Host "  This is common in enterprise environments and requires special appliance config." -ForegroundColor Gray
+    Write-Host ""
+
+    $tcpClient = $null; $netStream = $null; $writer = $null; $reader = $null
+    try {
+        $tcpClient = New-Object System.Net.Sockets.TcpClient
+        $task      = $tcpClient.ConnectAsync($proxyHost, $proxyPort)
+        if (-not $task.Wait(5000) -or $task.IsFaulted) {
+            Write-Host "  [SKIP] Proxy unreachable — skipping auth type detection." -ForegroundColor Gray
+            return
+        }
+
+        $netStream = $tcpClient.GetStream()
+        $writer    = New-Object System.IO.StreamWriter($netStream)
+        $reader    = New-Object System.IO.StreamReader($netStream)
+        $writer.AutoFlush = $true
+
+        # Send CONNECT without credentials to trigger auth challenge
+        $writer.Write("CONNECT management.azure.com:443 HTTP/1.1`r`nHost: management.azure.com:443`r`n`r`n")
+        $netStream.ReadTimeout = 5000
+
+        # Read response headers
+        $responseLines = [System.Collections.ArrayList]::new()
+        try {
+            $line = $reader.ReadLine()
+            while ($line -ne $null -and $line -ne '') {
+                [void]$responseLines.Add($line)
+                $line = $reader.ReadLine()
+            }
+        } catch {}
+
+        $responseText = $responseLines -join "`n"
+        Write-Host "  Proxy initial response:" -ForegroundColor Gray
+        $responseLines | Select-Object -First 5 | ForEach-Object { Write-Host "    $_" -ForegroundColor Gray }
+        Write-Host ""
+
+        if ($responseText -match '407') {
+            # Check Proxy-Authenticate header
+            if ($responseText -match 'Proxy-Authenticate:\s*NTLM') {
+                Write-Host "  [DETECTED] NTLM Proxy Authentication required." -ForegroundColor Yellow
+                Write-Host "  MEANING: Your proxy uses Windows NTLM authentication." -ForegroundColor White
+                Write-Host "  The Azure Migrate appliance must be configured with Windows credentials" -ForegroundColor White
+                Write-Host "  (domain\username and password) in the proxy settings." -ForegroundColor White
+                Write-Host "  Navigate to: Appliance Config Manager > Proxy Settings > enter credentials" -ForegroundColor Cyan
+                [void]$script:Recommendations.Add("PROXY NTLM AUTH: Proxy requires NTLM authentication. Configure domain credentials in Appliance Config Manager proxy settings.")
+            } elseif ($responseText -match 'Proxy-Authenticate:\s*Negotiate') {
+                Write-Host "  [DETECTED] Kerberos/Negotiate Proxy Authentication required." -ForegroundColor Yellow
+                Write-Host "  MEANING: Your proxy uses Kerberos authentication (common in Active Directory environments)." -ForegroundColor White
+                Write-Host "  The appliance must be domain-joined, or you must use NTLM fallback credentials." -ForegroundColor White
+                Write-Host "  If the appliance is NOT domain-joined, Kerberos auth will fail." -ForegroundColor White
+                [void]$script:Recommendations.Add("PROXY KERBEROS AUTH: Proxy requires Kerberos/Negotiate authentication. Appliance may need to be domain-joined, or proxy must allow NTLM fallback.")
+            } elseif ($responseText -match 'Proxy-Authenticate:\s*Basic') {
+                Write-Host "  [DETECTED] Basic Proxy Authentication required (username/password)." -ForegroundColor Yellow
+                Write-Host "  Configure proxy credentials in the Appliance Configuration Manager." -ForegroundColor White
+                [void]$script:Recommendations.Add("PROXY BASIC AUTH: Proxy requires Basic authentication. Configure username/password in Appliance Config Manager proxy settings.")
+            } else {
+                Write-Host "  [INFO] Proxy returned 407 but auth type header not found in response." -ForegroundColor Gray
+                Write-Host "  Check proxy logs for the authentication method required." -ForegroundColor Gray
+            }
+        } elseif ($responseText -match '200') {
+            Write-Host "  [PASS] Proxy does not require authentication for this connection." -ForegroundColor Green
+        } else {
+            Write-Host "  [INFO] Proxy response does not indicate authentication requirement." -ForegroundColor Gray
+        }
+
+    } catch {
+        Write-Host "  [WARN] Proxy auth detection error: $($_.Exception.Message)" -ForegroundColor Yellow
+    } finally {
+        if ($reader)    { try { $reader.Close();    $reader.Dispose()    } catch {} }
+        if ($writer)    { try { $writer.Close();    $writer.Dispose()    } catch {} }
+        if ($netStream) { try { $netStream.Close(); $netStream.Dispose() } catch {} }
+        if ($tcpClient) { try { $tcpClient.Close(); $tcpClient.Dispose() } catch {} }
+        $reader = $null; $writer = $null; $netStream = $null; $tcpClient = $null
+    }
+    Write-Host ""
+}
+
+# ── Feature 8: Config Manager Accessibility Check ────────────────────────────
+# (Folded into Test-ApplianceHealthApi above as Step 1 + Step 2)
+# Additional: check the Config Manager is accessible from a BROWSER perspective
+function Test-ConfigManagerAccess {
+    Write-Section "APPLIANCE CONFIG MANAGER BROWSER ACCESS CHECK"
+    Write-Host "  Verifying the Appliance Configuration Manager UI is accessible." -ForegroundColor Gray
+    Write-Host "  Admins access this at: https://localhost:44368 or https://[ApplianceIP]:44368" -ForegroundColor Gray
+    Write-Host ""
+
+    $ports = @(44368, 44369, 8080)   # 44368 is standard; some versions use 44369
+    $found = $false
+
+    foreach ($port in $ports) {
+        $tcpClient = $null
+        try {
+            $tcpClient = New-Object System.Net.Sockets.TcpClient
+            $task      = $tcpClient.ConnectAsync('127.0.0.1', $port)
+            $done      = $task.Wait(2000)
+            if ($done -and -not $task.IsFaulted) {
+                Write-Host "  [PASS] Config Manager is accessible on port $port" -ForegroundColor Green
+                Write-Host "  Open a browser on this machine and go to:" -ForegroundColor White
+                Write-Host "  https://localhost:$port" -ForegroundColor Cyan
+                $found = $true
+
+                # Also check from LAN IP so remote admins can reach it
+                try {
+                    $lanIp = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                        Where-Object { $_.IPAddress -notmatch '^127\.' } |
+                        Select-Object -First 1).IPAddress
+                    if ($lanIp) {
+                        Write-Host "  Or from another machine on the same network:" -ForegroundColor White
+                        Write-Host "  https://${lanIp}:$port" -ForegroundColor Cyan
+                    }
+                } catch {}
+                break
+            }
+        } catch {}
+        finally {
+            if ($tcpClient) { try { $tcpClient.Close(); $tcpClient.Dispose() } catch {} }
+            $tcpClient = $null
+        }
+    }
+
+    if (-not $found) {
+        Write-Host "  [FAIL] Config Manager is NOT accessible on any expected port (44368, 44369, 8080)." -ForegroundColor Red
+        Write-Host "  This means the appliance web interface is not running." -ForegroundColor Red
+        Write-Host ""
+        Write-Host "  Possible causes:" -ForegroundColor Yellow
+        Write-Host "  1. The Azure Migrate appliance software is not installed on this machine" -ForegroundColor Yellow
+        Write-Host "  2. The IIS or Kestrel web server hosting the Config Manager has crashed" -ForegroundColor Yellow
+        Write-Host "  3. A local firewall is blocking loopback connections on port 44368" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  To diagnose: Open Services.msc and check the status of Azure Migrate services." -ForegroundColor White
+        Write-Host "  Try restarting them or rebooting the appliance." -ForegroundColor White
+        [void]$script:Recommendations.Add("CONFIG MANAGER INACCESSIBLE: Ports 44368/44369/8080 all unresponsive on localhost. Appliance web server is down. Check Services.msc for Azure Migrate services and restart them.")
+    }
+    Write-Host ""
+}
+
 # v3.0 NEW SCRIPT-LEVEL RESULT STORES
 # ============================================================================
 $script:TraceRouteResults      = [System.Collections.ArrayList]::new()
@@ -3047,6 +3873,10 @@ function Invoke-Cleanup {
         'Virtualization info'         = 'VirtualizationInfo'
         'Appliance registry state'    = 'ApplianceState'
         'Appliance log findings'      = 'ApplianceLogFindings'
+        'Azure service health'        = 'AzureHealthResult'
+        'Appliance health API result' = 'ApplianceHealthResult'
+        '.NET framework result'       = 'DotNetResult'
+        'Outbound NAT IP result'      = 'NatIpResult'
         'Executive summary data'      = 'ExecutiveSummary'
         'Next steps text'             = 'NextStepsText'
     }
@@ -3262,17 +4092,33 @@ function Main {
     Read-Host
 
     try {
+        # ----- Start timer (v4.0) -----
+        $script:StartTime = Get-Date
+
+        # ----- Azure Service Health (v4.0 — run first to catch outages) -----
+        Test-AzureServiceHealth -Cloud $cloud
+
         # ----- Environment Info -----
         Get-EnvironmentInfo
 
-        # ----- Virtualization Detection (v3.0) -----
+        # ----- .NET Framework Version (v4.0) -----
+        Test-DotNetVersion
+
+        # ----- Virtualization Detection -----
         Get-VirtualizationInfo
 
-        # ----- Appliance Registration State (v3.0) -----
+        # ----- Appliance Registration State -----
         Get-ApplianceRegistrationState
 
-        # ----- Appliance Log Analysis (v3.0) -----
+        # ----- Appliance Config Manager Health (v4.0) -----
+        Test-ApplianceHealthApi
+        Test-ConfigManagerAccess
+
+        # ----- Appliance Log Analysis -----
         Get-ApplianceLogs -Scenario $scenario
+
+        # ----- Outbound NAT IP (v4.0) -----
+        Get-OutboundNatIp
 
         # ----- Proxy Detection -----
         $proxyDetected = Get-ProxyConfiguration
@@ -3283,10 +4129,10 @@ function Main {
         # ----- Basic Connectivity -----
         Test-BasicConnectivity
 
-        # ----- Clock Skew Check (v3.0) -----
+        # ----- Clock Skew Check -----
         Test-ClockSkew
 
-        # ----- Hosts File Check (v3.0) -----
+        # ----- Hosts File Check -----
         Test-HostsFile
 
         # ----- Platform Source Connectivity -----
@@ -3311,30 +4157,33 @@ function Main {
             Write-Host "  Added $($customUrls.Count) custom URL(s) to the test list." -ForegroundColor Cyan
         }
 
-        # ----- Run Connectivity Tests -----
-        Invoke-ConnectivityTests -UrlList $urlList
+        # ----- Run Connectivity Tests (Parallel v4.0) -----
+        Invoke-ConnectivityTestsParallel -UrlList $urlList
 
         # ----- Private Link DNS Validation -----
         if ($privateLink) {
             Test-PrivateLinkDns -UrlList $urlList -Cloud $cloud
         }
 
-        # ----- DNS Comparison vs 8.8.8.8 (v3.0) -----
+        # ----- DNS Comparison vs 8.8.8.8 -----
         Test-DnsComparison
 
-        # ----- TCP Behavior Analysis (v3.0) -----
+        # ----- TCP Behavior Analysis -----
         Test-TcpBehavior
 
-        # ----- Traceroute (v3.0 - only if TCP failures exist) -----
+        # ----- Flap / Retry Test (v4.0) -----
+        Test-FlakyConnections
+
+        # ----- Traceroute (only if TCP failures exist) -----
         $hasTcpFails = ($script:TestResults | Where-Object { $_.DnsPass -and -not $_.TcpPass }).Count -gt 0
         if ($hasTcpFails) {
             Test-TraceRoute -Cloud $cloud
         }
 
-        # ----- Proxy CONNECT Test (v3.0 - only if proxy detected) -----
+        # ----- Proxy CONNECT Test (only if proxy detected) -----
+        $proxyStr = ''
         if ($proxyDetected) {
-            $proxyStr = ''
-            $regPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+            $regPath     = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
             $proxyEnable = (Get-ItemProperty -Path $regPath -Name 'ProxyEnable' -ErrorAction SilentlyContinue).ProxyEnable
             $proxyServer = (Get-ItemProperty -Path $regPath -Name 'ProxyServer' -ErrorAction SilentlyContinue).ProxyServer
             if ($proxyEnable -eq 1 -and $proxyServer) { $proxyStr = $proxyServer }
@@ -3342,10 +4191,11 @@ function Main {
                 $winhttp = netsh winhttp show proxy 2>&1 | Out-String
                 if ($winhttp -match 'Proxy Server\s*[=:]\s*(\S+)') { $proxyStr = $matches[1] }
             }
-            Test-ProxyConnect -ProxyString $proxyStr
+            Test-ProxyConnect    -ProxyString $proxyStr
+            Test-ProxyAuthType   -ProxyString $proxyStr
         }
 
-        # ----- TLS Certificate Chain Inspection (v3.0) -----
+        # ----- TLS Certificate Chain Inspection -----
         Get-TlsCertificateChain -Cloud $cloud
 
         # ----- Executive Summary (v3.0) -----
@@ -3371,9 +4221,12 @@ function Main {
             -PrivateLink $privateLink -ProxyDetected $proxyDetected
 
         # ----- Final Banner -----
+        $elapsed = (Get-Date) - $script:StartTime
+        $elapsedStr = '{0:mm}m {0:ss}s' -f $elapsed
         Write-Host ""
         Write-Host "===============================================================================" -ForegroundColor Cyan
-        Write-Host "  v3.0 Diagnostic complete. Report saved to:" -ForegroundColor Cyan
+        Write-Host "  v4.0 Diagnostic complete in $elapsedStr." -ForegroundColor Cyan
+        Write-Host "  Report saved to:" -ForegroundColor Cyan
         Write-Host "  $($script:ReportPath)" -ForegroundColor White
         Write-Host ""
         Write-Host "  The report opens with an EXECUTIVE SUMMARY and NEXT STEPS." -ForegroundColor Cyan
