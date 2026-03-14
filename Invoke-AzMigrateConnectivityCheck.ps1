@@ -2962,7 +2962,7 @@ function Test-ClockSkew {
                 Write-Host "    net stop w32time" -ForegroundColor Cyan
                 Write-Host "    net start w32time" -ForegroundColor Cyan
                 Write-Host "    w32tm /resync /force" -ForegroundColor Cyan
-                [void]$script:Recommendations.Add("CRITICAL CLOCK SKEW: Clock is ${mins}m ${secs}s off. Run as Admin: net stop w32time && net start w32time && w32tm /resync /force")
+                [void]$script:Recommendations.Add("CRITICAL CLOCK SKEW: Clock is ${mins}m ${secs}s off. Run as Admin: net stop w32time; net start w32time; w32tm /resync /force")
             }
         }
     } catch {
