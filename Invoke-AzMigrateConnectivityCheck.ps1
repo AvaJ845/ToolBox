@@ -35,7 +35,7 @@
 .NOTES
     Version:  3.0
     Requires: PowerShell 5.1+
-    Author:   Azure Migrate Field Engineering
+   
 
 .LINK
     https://learn.microsoft.com/en-us/azure/migrate/migrate-appliance
